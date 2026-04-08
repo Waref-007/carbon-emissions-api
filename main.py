@@ -1,4 +1,3 @@
-%%writefile main.py
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from typing import List
 from io import BytesIO
