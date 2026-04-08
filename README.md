@@ -1,2 +1,11 @@
-# carbon-emissions-api
-Production-ready FastAPI backend for calculating carbon emissions (Scope 1, 2, 3) using DEFRA emission factors. Supports batch processing, data validation, error handling, and structured reporting.
+# Carbon Emissions API
+
+FastAPI backend for deterministic carbon emissions calculations using DEFRA 2025 factors.
+
+## Files
+- `main.py` -> FastAPI app
+- `engine.py` -> emissions engine logic
+- `requirements.txt` -> dependencies
+
+## Run locally
+uvicorn main:app --host 0.0.0.0 --port 8000
