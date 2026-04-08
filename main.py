@@ -1,5 +1,5 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
-from typing import List
+from typing import List, Annotated
 from io import BytesIO
 import pandas as pd
 
@@ -24,13 +24,15 @@ def calculate(payload: dict):
         activities = payload.get("activities", [])
 
         if not isinstance(activities, list):
-            return {"error": "activities must be a list"}
+            raise HTTPException(status_code=400, detail="activities must be a list")
 
         result = run_emissions_engine({"activities": activities})
         return result
 
+    except HTTPException:
+        raise
     except Exception as e:
-        return {"error": str(e)}
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 def read_uploaded_file(uploaded_file: UploadFile) -> pd.DataFrame:
@@ -49,7 +51,12 @@ def read_uploaded_file(uploaded_file: UploadFile) -> pd.DataFrame:
 
 
 @app.post("/upload-calculate")
-async def upload_calculate(files: List[UploadFile] = File(...)):
+async def upload_calculate(
+    files: Annotated[
+        List[UploadFile],
+        File(description="Upload one or more CSV/XLSX activity datasets")
+    ]
+):
     try:
         if not files:
             raise HTTPException(status_code=400, detail="No files uploaded.")
@@ -60,7 +67,6 @@ async def upload_calculate(files: List[UploadFile] = File(...)):
         for uploaded_file in files:
             df = read_uploaded_file(uploaded_file)
 
-            # Keep track of which file each row came from
             if "source_file" not in df.columns:
                 df["source_file"] = uploaded_file.filename
 
