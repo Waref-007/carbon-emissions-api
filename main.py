@@ -62,7 +62,16 @@ def read_uploaded_file(uploaded_file: UploadFile) -> pd.DataFrame:
             detail=f"Unsupported file format for '{uploaded_file.filename}'. Please upload CSV or Excel files."
         )
 
-
+@app.get("/debug-routes")
+def debug_routes():
+    return {
+        "routes": [
+            "/",
+            "/health",
+            "/calculate",
+            "/upload-calculate"
+        ]
+    }
 @app.post("/upload-calculate")
 async def upload_calculate(
     files: Annotated[
