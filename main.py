@@ -1,4 +1,5 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Annotated
 from io import BytesIO
 import pandas as pd
@@ -6,6 +7,18 @@ import pandas as pd
 from engine import run_emissions_engine, preprocess_uploaded_dataframe
 
 app = FastAPI(title="Carbon Emissions API")
+
+# Allow the client website to call this API
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://gscsustainability.co.uk",
+        "https://www.gscsustainability.co.uk",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.get("/")
