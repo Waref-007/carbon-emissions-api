@@ -31,6 +31,18 @@ def health():
     return {"status": "healthy"}
 
 
+@app.get("/debug-routes")
+def debug_routes():
+    return {
+        "routes": [
+            "/",
+            "/health",
+            "/calculate",
+            "/upload-calculate"
+        ]
+    }
+
+
 @app.post("/calculate")
 def calculate(payload: dict):
     try:
@@ -48,30 +60,33 @@ def calculate(payload: dict):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def normalize_uploaded_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [
+        str(col).strip().lower().replace("\n", " ").replace("\r", " ")
+        for col in df.columns
+    ]
+    return df
+
+
 def read_uploaded_file(uploaded_file: UploadFile) -> pd.DataFrame:
     filename = (uploaded_file.filename or "").lower()
     content = uploaded_file.file.read()
 
     if filename.endswith(".csv"):
-        return pd.read_csv(BytesIO(content))
+        df = pd.read_csv(BytesIO(content))
     elif filename.endswith(".xlsx") or filename.endswith(".xls"):
-        return pd.read_excel(BytesIO(content))
+        df = pd.read_excel(BytesIO(content))
     else:
         raise HTTPException(
             status_code=400,
             detail=f"Unsupported file format for '{uploaded_file.filename}'. Please upload CSV or Excel files."
         )
 
-@app.get("/debug-routes")
-def debug_routes():
-    return {
-        "routes": [
-            "/",
-            "/health",
-            "/calculate",
-            "/upload-calculate"
-        ]
-    }
+    df = normalize_uploaded_columns(df)
+    return df
+
+
 @app.post("/upload-calculate")
 async def upload_calculate(
     files: Annotated[
@@ -95,7 +110,8 @@ async def upload_calculate(
             dataframes.append(df)
             uploaded_files_info.append({
                 "filename": uploaded_file.filename,
-                "rows": len(df)
+                "rows": len(df),
+                "columns": list(df.columns)
             })
 
         combined_df = pd.concat(dataframes, ignore_index=True)
@@ -105,7 +121,10 @@ async def upload_calculate(
         if missing_columns:
             raise HTTPException(
                 status_code=400,
-                detail=f"Missing required columns: {missing_columns}"
+                detail={
+                    "message": f"Missing required columns: {missing_columns}",
+                    "detected_columns": list(combined_df.columns)
+                }
             )
 
         combined_df_clean = preprocess_uploaded_dataframe(combined_df)
