@@ -216,7 +216,7 @@ async def upload_calculate_download(
                         logo = XLImage(logo_path)
                         logo.width = 140
                         logo.height = 60
-                        ws.add_image(logo, "E1")
+                        ws.add_image(logo, "L1")
                     except Exception:
                         pass
 
