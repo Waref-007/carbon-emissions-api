@@ -207,7 +207,7 @@ async def upload_calculate_download(
                 ws = workbook[sheet_name]
                 ws["A1"] = "GS Carbon Emissions Report"
                 ws["A2"] = "Generated from uploaded datasets"
-                ws["A3"] = "Aligned to current configured emissions logic and reporting structure"
+                ws["A3"] = "Aligned to current configured emissions logic and reporting structure, Aligned with GHG Protocol and DEFRA 2025"
 
                 # Add logo if present
                 logo_path = "logo.png"
