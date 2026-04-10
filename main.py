@@ -72,7 +72,7 @@ def calculate(payload: dict):
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {str(e)}")
 
 
 def normalize_uploaded_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -200,16 +200,22 @@ def get_gspread_client():
     if not service_account_json:
         raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON is not set")
 
-    credentials_info = json.loads(service_account_json)
+    try:
+        credentials_info = json.loads(service_account_json)
+    except Exception as e:
+        raise ValueError(f"GOOGLE_SERVICE_ACCOUNT_JSON is invalid JSON: {type(e).__name__}: {str(e)}")
 
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive"
     ]
 
-    credentials = Credentials.from_service_account_info(credentials_info, scopes=scopes)
-    gc = gspread.authorize(credentials)
-    return gc
+    try:
+        credentials = Credentials.from_service_account_info(credentials_info, scopes=scopes)
+        gc = gspread.authorize(credentials)
+        return gc
+    except Exception as e:
+        raise ValueError(f"Google credentials authorization failed: {type(e).__name__}: {str(e)}")
 
 
 def append_lead_row(user_data: dict, result: dict, uploaded_files_info: list):
@@ -217,9 +223,15 @@ def append_lead_row(user_data: dict, result: dict, uploaded_files_info: list):
     if not spreadsheet_id:
         raise ValueError("GOOGLE_SHEET_ID is not set")
 
-    gc = get_gspread_client()
-    sh = gc.open_by_key(spreadsheet_id)
-    ws = sh.sheet1
+    try:
+        gc = get_gspread_client()
+        sh = gc.open_by_key(spreadsheet_id)
+        ws = sh.sheet1
+    except Exception as e:
+        raise ValueError(
+            f"Google Sheet access failed. Check GOOGLE_SHEET_ID, API enablement, and sharing permissions. "
+            f"Original error: {type(e).__name__}: {str(e)}"
+        )
 
     totals = result.get("totals", {})
     analytics = result.get("analytics", {})
@@ -232,24 +244,29 @@ def append_lead_row(user_data: dict, result: dict, uploaded_files_info: list):
     if analytics.get("top_site_by_kgco2e"):
         top_site = analytics["top_site_by_kgco2e"].get("site_name", "")
 
+    # IMPORTANT:
+    # This row order must match the Google Sheet header order exactly.
     row = [
-        datetime.now(timezone.utc).isoformat(),
-        user_data.get("full_name", ""),
-        user_data.get("email", ""),
-        user_data.get("company_name", ""),
-        user_data.get("phone_number", ""),
-        str(user_data.get("privacy_consent", False)),
-        str(user_data.get("contact_consent", False)),
-        len(uploaded_files_info),
-        result.get("input_row_count", 0),
-        totals.get("total_kgCO2e", 0),
-        totals.get("total_tCO2e", 0),
-        top_category,
-        top_site,
-        "website_calculator"
+        datetime.now(timezone.utc).isoformat(),       # Timestamp
+        user_data.get("full_name", ""),               # Full Name
+        user_data.get("email", ""),                   # Email
+        user_data.get("company_name", ""),            # Company_name
+        user_data.get("phone_number", ""),            # Phone_number
+        str(user_data.get("privacy_consent", False)), # Privacy_consent
+        str(user_data.get("contact_consent", False)), # Contact_consent
+        len(uploaded_files_info),                     # Uploaded_files_count
+        result.get("input_row_count", 0),             # Input_row_count
+        totals.get("total_kgCO2e", 0),                # Total_Kgco2e
+        totals.get("total_tCO2e", 0),                 # Total_tco2e
+        top_category,                                 # Top_category
+        top_site,                                     # Top_site
+        "website_calculator"                          # Source
     ]
 
-    ws.append_row(row, value_input_option="USER_ENTERED")
+    try:
+        ws.append_row(row, value_input_option="USER_ENTERED")
+    except Exception as e:
+        raise ValueError(f"Appending row to Google Sheet failed: {type(e).__name__}: {str(e)}")
 
 
 @app.post("/upload-calculate")
@@ -316,7 +333,7 @@ async def upload_calculate(
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {str(e)}")
 
 
 @app.post("/upload-calculate-download")
@@ -416,7 +433,7 @@ async def upload_calculate_download(
                 ws = workbook[sheet_name]
                 ws["A1"] = "GS Carbon Emissions Report"
                 ws["A2"] = "Generated from uploaded datasets"
-                ws["A3"] = "*Aligned to current configured emissions logic and reporting structure **Aligned with GHG Protocol and DEFRA 2025	"
+                ws["A3"] = "*Aligned to current configured emissions logic and reporting structure **Aligned with GHG Protocol and DEFRA 2025"
 
                 logo_path = "logo.png"
                 if os.path.exists(logo_path):
@@ -431,7 +448,7 @@ async def upload_calculate_download(
             chart_ws = workbook.create_sheet("Charts")
             chart_ws["A1"] = "GS Carbon Emissions Report"
             chart_ws["A2"] = "Generated from uploaded datasets"
-            chart_ws["A3"] = "Aligned with GHG Protocol and DEFRA 2025"
+            chart_ws["A3"] = "*Aligned to current configured emissions logic and reporting structure **Aligned with GHG Protocol and DEFRA 2025"
 
             logo_path = "logo.png"
             if os.path.exists(logo_path):
@@ -474,4 +491,4 @@ async def upload_calculate_download(
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {str(e)}")
