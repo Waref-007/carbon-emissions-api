@@ -6,11 +6,7 @@ from io import BytesIO
 import io
 import pandas as pd
 import os
-import json
-from datetime import datetime, timezone
 
-import gspread
-from google.oauth2.service_account import Credentials
 from openpyxl.drawing.image import Image as XLImage
 from openpyxl.chart import BarChart, Reference
 
@@ -195,80 +191,6 @@ def add_excel_chart(ws, title, data_col, category_col, start_row, end_row, ancho
     ws.add_chart(chart, anchor)
 
 
-def get_gspread_client():
-    service_account_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
-    if not service_account_json:
-        raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON is not set")
-
-    try:
-        credentials_info = json.loads(service_account_json)
-    except Exception as e:
-        raise ValueError(f"GOOGLE_SERVICE_ACCOUNT_JSON is invalid JSON: {type(e).__name__}: {str(e)}")
-
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive"
-    ]
-
-    try:
-        credentials = Credentials.from_service_account_info(credentials_info, scopes=scopes)
-        gc = gspread.authorize(credentials)
-        return gc
-    except Exception as e:
-        raise ValueError(f"Google credentials authorization failed: {type(e).__name__}: {str(e)}")
-
-
-def append_lead_row(user_data: dict, result: dict, uploaded_files_info: list):
-    spreadsheet_id = os.getenv("GOOGLE_SHEET_ID")
-    if not spreadsheet_id:
-        raise ValueError("GOOGLE_SHEET_ID is not set")
-
-    try:
-        gc = get_gspread_client()
-        sh = gc.open_by_key(spreadsheet_id)
-        ws = sh.sheet1
-    except Exception as e:
-        raise ValueError(
-            f"Google Sheet access failed. Check GOOGLE_SHEET_ID, API enablement, and sharing permissions. "
-            f"Original error: {type(e).__name__}: {str(e)}"
-        )
-
-    totals = result.get("totals", {})
-    analytics = result.get("analytics", {})
-
-    top_category = ""
-    if analytics.get("top_category_by_kgco2e"):
-        top_category = analytics["top_category_by_kgco2e"].get("category", "")
-
-    top_site = ""
-    if analytics.get("top_site_by_kgco2e"):
-        top_site = analytics["top_site_by_kgco2e"].get("site_name", "")
-
-    # IMPORTANT:
-    # This row order must match the Google Sheet header order exactly.
-    row = [
-        datetime.now(timezone.utc).isoformat(),       # Timestamp
-        user_data.get("full_name", ""),               # Full Name
-        user_data.get("email", ""),                   # Email
-        user_data.get("company_name", ""),            # Company_name
-        user_data.get("phone_number", ""),            # Phone_number
-        str(user_data.get("privacy_consent", False)), # Privacy_consent
-        str(user_data.get("contact_consent", False)), # Contact_consent
-        len(uploaded_files_info),                     # Uploaded_files_count
-        result.get("input_row_count", 0),             # Input_row_count
-        totals.get("total_kgCO2e", 0),                # Total_Kgco2e
-        totals.get("total_tCO2e", 0),                 # Total_tco2e
-        top_category,                                 # Top_category
-        top_site,                                     # Top_site
-        "website_calculator"                          # Source
-    ]
-
-    try:
-        ws.append_row(row, value_input_option="USER_ENTERED")
-    except Exception as e:
-        raise ValueError(f"Appending row to Google Sheet failed: {type(e).__name__}: {str(e)}")
-
-
 @app.post("/upload-calculate")
 async def upload_calculate(
     files: Annotated[List[UploadFile], File(description="Upload one or more CSV/XLSX activity datasets")],
@@ -314,19 +236,6 @@ async def upload_calculate(
             "phone_number": phone_number
         }
         result["analytics"] = build_analytics(result)
-
-        append_lead_row(
-            {
-                "full_name": full_name,
-                "email": email,
-                "company_name": company_name,
-                "phone_number": phone_number,
-                "privacy_consent": True,
-                "contact_consent": True
-            },
-            result,
-            uploaded_files_info
-        )
 
         return result
 
@@ -382,19 +291,6 @@ async def upload_calculate_download(
         }
         result["analytics"] = build_analytics(result)
 
-        append_lead_row(
-            {
-                "full_name": full_name,
-                "email": email,
-                "company_name": company_name,
-                "phone_number": phone_number,
-                "privacy_consent": True,
-                "contact_consent": True
-            },
-            result,
-            uploaded_files_info
-        )
-
         df_results = pd.DataFrame(result.get("line_items", []))
         df_errors = pd.DataFrame(result.get("errors", []))
         df_summary_scope = pd.DataFrame(result.get("summary_by_scope", []))
@@ -433,7 +329,7 @@ async def upload_calculate_download(
                 ws = workbook[sheet_name]
                 ws["A1"] = "GS Carbon Emissions Report"
                 ws["A2"] = "Generated from uploaded datasets"
-                ws["A3"] = "*Aligned to current configured emissions logic and reporting structure **Aligned with GHG Protocol and DEFRA 2025"
+                ws["A3"] = "Aligned with GHG Protocol and DEFRA 2025"
 
                 logo_path = "logo.png"
                 if os.path.exists(logo_path):
@@ -448,7 +344,7 @@ async def upload_calculate_download(
             chart_ws = workbook.create_sheet("Charts")
             chart_ws["A1"] = "GS Carbon Emissions Report"
             chart_ws["A2"] = "Generated from uploaded datasets"
-            chart_ws["A3"] = "*Aligned to current configured emissions logic and reporting structure **Aligned with GHG Protocol and DEFRA 2025"
+            chart_ws["A3"] = "Aligned with GHG Protocol and DEFRA 2025"
 
             logo_path = "logo.png"
             if os.path.exists(logo_path):
@@ -473,10 +369,26 @@ async def upload_calculate_download(
                 chart_ws[f"E{i}"] = row.get("emissions_kgCO2e")
 
             if len(result.get("summary_by_scope", [])) > 0:
-                add_excel_chart(chart_ws, "Emissions by Scope", 2, 1, 6, 6 + len(result.get("summary_by_scope", [])), "G6")
+                add_excel_chart(
+                    chart_ws,
+                    "Emissions by Scope",
+                    2,
+                    1,
+                    6,
+                    6 + len(result.get("summary_by_scope", [])),
+                    "G6"
+                )
 
             if len(result.get("summary_by_scope_category", [])) > 0:
-                add_excel_chart(chart_ws, "Emissions by Scope and Category", 5, 4, 6, 6 + len(result.get("summary_by_scope_category", [])), "G24")
+                add_excel_chart(
+                    chart_ws,
+                    "Emissions by Scope and Category",
+                    5,
+                    4,
+                    6,
+                    6 + len(result.get("summary_by_scope_category", [])),
+                    "G24"
+                )
 
         output.seek(0)
 
