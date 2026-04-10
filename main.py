@@ -6,7 +6,11 @@ from io import BytesIO
 import io
 import pandas as pd
 import os
+import json
+from datetime import datetime, timezone
 
+import gspread
+from google.oauth2.service_account import Credentials
 from openpyxl.drawing.image import Image as XLImage
 from openpyxl.chart import BarChart, Reference
 
@@ -137,7 +141,6 @@ def prepare_combined_dataframe(files: List[UploadFile]):
 
 def build_analytics(result: dict) -> dict:
     df_results = pd.DataFrame(result.get("line_items", []))
-
     analytics = {}
 
     if df_results.empty:
@@ -192,14 +195,91 @@ def add_excel_chart(ws, title, data_col, category_col, start_row, end_row, ancho
     ws.add_chart(chart, anchor)
 
 
+def get_gspread_client():
+    service_account_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+    if not service_account_json:
+        raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON is not set")
+
+    credentials_info = json.loads(service_account_json)
+
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive"
+    ]
+
+    credentials = Credentials.from_service_account_info(credentials_info, scopes=scopes)
+    gc = gspread.authorize(credentials)
+    return gc
+
+
+def append_lead_row(user_data: dict, result: dict, uploaded_files_info: list):
+    spreadsheet_id = os.getenv("GOOGLE_SHEET_ID")
+    if not spreadsheet_id:
+        raise ValueError("GOOGLE_SHEET_ID is not set")
+
+    gc = get_gspread_client()
+    sh = gc.open_by_key(spreadsheet_id)
+    ws = sh.sheet1
+
+    totals = result.get("totals", {})
+    analytics = result.get("analytics", {})
+
+    top_category = ""
+    if analytics.get("top_category_by_kgco2e"):
+        top_category = analytics["top_category_by_kgco2e"].get("category", "")
+
+    top_site = ""
+    if analytics.get("top_site_by_kgco2e"):
+        top_site = analytics["top_site_by_kgco2e"].get("site_name", "")
+
+    row = [
+        datetime.now(timezone.utc).isoformat(),
+        user_data.get("full_name", ""),
+        user_data.get("email", ""),
+        user_data.get("company_name", ""),
+        user_data.get("phone_number", ""),
+        str(user_data.get("privacy_consent", False)),
+        str(user_data.get("contact_consent", False)),
+        len(uploaded_files_info),
+        result.get("input_row_count", 0),
+        totals.get("total_kgCO2e", 0),
+        totals.get("total_tCO2e", 0),
+        top_category,
+        top_site,
+        "website_calculator"
+    ]
+
+    ws.append_row(row, value_input_option="USER_ENTERED")
+
+
 @app.post("/upload-calculate")
 async def upload_calculate(
     files: Annotated[List[UploadFile], File(description="Upload one or more CSV/XLSX activity datasets")],
-    privacy_consent: Annotated[str, Form(...)]
+    privacy_consent: Annotated[str, Form(...)],
+    contact_consent: Annotated[str, Form(...)],
+    full_name: Annotated[str, Form(...)],
+    email: Annotated[str, Form(...)],
+    company_name: Annotated[str, Form(...)],
+    phone_number: Annotated[str, Form(...)]
 ):
     try:
         if str(privacy_consent).lower() != "true":
             raise HTTPException(status_code=400, detail="Privacy consent is required.")
+
+        if str(contact_consent).lower() != "true":
+            raise HTTPException(status_code=400, detail="Contact consent is required.")
+
+        if not full_name.strip():
+            raise HTTPException(status_code=400, detail="Full name is required.")
+
+        if not email.strip():
+            raise HTTPException(status_code=400, detail="Email is required.")
+
+        if not company_name.strip():
+            raise HTTPException(status_code=400, detail="Company name is required.")
+
+        if not phone_number.strip():
+            raise HTTPException(status_code=400, detail="Phone number is required.")
 
         combined_df_clean, uploaded_files_info = prepare_combined_dataframe(files)
 
@@ -209,7 +289,27 @@ async def upload_calculate(
         result["uploaded_files"] = uploaded_files_info
         result["input_row_count"] = len(combined_df_clean)
         result["privacy_consent"] = True
+        result["contact_consent"] = True
+        result["user"] = {
+            "full_name": full_name,
+            "email": email,
+            "company_name": company_name,
+            "phone_number": phone_number
+        }
         result["analytics"] = build_analytics(result)
+
+        append_lead_row(
+            {
+                "full_name": full_name,
+                "email": email,
+                "company_name": company_name,
+                "phone_number": phone_number,
+                "privacy_consent": True,
+                "contact_consent": True
+            },
+            result,
+            uploaded_files_info
+        )
 
         return result
 
@@ -221,12 +321,32 @@ async def upload_calculate(
 
 @app.post("/upload-calculate-download")
 async def upload_calculate_download(
-    files: Annotated[List[UploadFile], File(description="Upload one or more CSV/XLSX activity datasets to calculate emissions and downlaod report")],
-    privacy_consent: Annotated[str, Form(...)]
+    files: Annotated[List[UploadFile], File(description="Upload one or more CSV/XLSX activity datasets")],
+    privacy_consent: Annotated[str, Form(...)],
+    contact_consent: Annotated[str, Form(...)],
+    full_name: Annotated[str, Form(...)],
+    email: Annotated[str, Form(...)],
+    company_name: Annotated[str, Form(...)],
+    phone_number: Annotated[str, Form(...)]
 ):
     try:
         if str(privacy_consent).lower() != "true":
             raise HTTPException(status_code=400, detail="Privacy consent is required.")
+
+        if str(contact_consent).lower() != "true":
+            raise HTTPException(status_code=400, detail="Contact consent is required.")
+
+        if not full_name.strip():
+            raise HTTPException(status_code=400, detail="Full name is required.")
+
+        if not email.strip():
+            raise HTTPException(status_code=400, detail="Email is required.")
+
+        if not company_name.strip():
+            raise HTTPException(status_code=400, detail="Company name is required.")
+
+        if not phone_number.strip():
+            raise HTTPException(status_code=400, detail="Phone number is required.")
 
         combined_df_clean, uploaded_files_info = prepare_combined_dataframe(files)
 
@@ -236,7 +356,27 @@ async def upload_calculate_download(
         result["uploaded_files"] = uploaded_files_info
         result["input_row_count"] = len(combined_df_clean)
         result["privacy_consent"] = True
+        result["contact_consent"] = True
+        result["user"] = {
+            "full_name": full_name,
+            "email": email,
+            "company_name": company_name,
+            "phone_number": phone_number
+        }
         result["analytics"] = build_analytics(result)
+
+        append_lead_row(
+            {
+                "full_name": full_name,
+                "email": email,
+                "company_name": company_name,
+                "phone_number": phone_number,
+                "privacy_consent": True,
+                "contact_consent": True
+            },
+            result,
+            uploaded_files_info
+        )
 
         df_results = pd.DataFrame(result.get("line_items", []))
         df_errors = pd.DataFrame(result.get("errors", []))
@@ -246,6 +386,7 @@ async def upload_calculate_download(
         df_analytics = pd.DataFrame(
             [{"metric": k, "value": str(v)} for k, v in result.get("analytics", {}).items()]
         )
+        df_user = pd.DataFrame([result["user"]])
 
         totals = result.get("totals", {})
         df_overview = pd.DataFrame([{
@@ -253,7 +394,8 @@ async def upload_calculate_download(
             "total_tCO2e": totals.get("total_tCO2e", 0),
             "input_row_count": len(combined_df_clean),
             "uploaded_files_count": len(uploaded_files_info),
-            "privacy_consent": True
+            "privacy_consent": True,
+            "contact_consent": True
         }])
 
         output = io.BytesIO()
@@ -266,6 +408,7 @@ async def upload_calculate_download(
             df_errors.to_excel(writer, sheet_name="Errors", index=False, startrow=6)
             df_uploaded_files.to_excel(writer, sheet_name="Uploaded Files", index=False, startrow=6)
             df_analytics.to_excel(writer, sheet_name="Analytics", index=False, startrow=6)
+            df_user.to_excel(writer, sheet_name="User Details", index=False, startrow=6)
 
             workbook = writer.book
 
@@ -273,42 +416,39 @@ async def upload_calculate_download(
                 ws = workbook[sheet_name]
                 ws["A1"] = "GS Carbon Emissions Report"
                 ws["A2"] = "Generated from uploaded datasets"
-                ws["A3"] = "Aligned with GHG Protocol and DEFRA 2025"
+                ws["A3"] = "*Aligned to current configured emissions logic and reporting structure **Aligned with GHG Protocol and DEFRA 2025	"
 
                 logo_path = "logo.png"
                 if os.path.exists(logo_path):
                     try:
                         logo = XLImage(logo_path)
                         logo.width = 140
-                        logo.height = 60
-                        ws.add_image(logo, "E1")
+                        logo.height = 70
+                        ws.add_image(logo, "L1")
                     except Exception:
                         pass
 
-            # Create chart sheet
             chart_ws = workbook.create_sheet("Charts")
             chart_ws["A1"] = "GS Carbon Emissions Report"
             chart_ws["A2"] = "Generated from uploaded datasets"
-            chart_ws["A3"] = "°Aligned to current configured emissions logic and reporting structure °Aligned with GHG Protocol and DEFRA 2025"
+            chart_ws["A3"] = "Aligned with GHG Protocol and DEFRA 2025"
 
             logo_path = "logo.png"
             if os.path.exists(logo_path):
                 try:
                     logo = XLImage(logo_path)
                     logo.width = 140
-                    logo.height = 60
+                    logo.height = 70
                     chart_ws.add_image(logo, "L1")
                 except Exception:
                     pass
 
-            # Scope chart data
             chart_ws["A6"] = "Scope"
             chart_ws["B6"] = "kg CO2e"
             for i, row in enumerate(result.get("summary_by_scope", []), start=7):
                 chart_ws[f"A{i}"] = row.get("scope")
                 chart_ws[f"B{i}"] = row.get("emissions_kgCO2e")
 
-            # Category chart data
             chart_ws["D6"] = "Category"
             chart_ws["E6"] = "kg CO2e"
             for i, row in enumerate(result.get("summary_by_scope_category", []), start=7):
