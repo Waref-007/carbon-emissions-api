@@ -5,5 +5,4 @@ openpyxl
 numpy
 python-multipart
 Pillow
-gspread
-google-auth
+requests
