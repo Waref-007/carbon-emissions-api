@@ -6,6 +6,7 @@ from io import BytesIO
 import io
 import pandas as pd
 import os
+import requests
 
 from openpyxl.drawing.image import Image as XLImage
 from openpyxl.chart import BarChart, Reference
@@ -191,6 +192,36 @@ def add_excel_chart(ws, title, data_col, category_col, start_row, end_row, ancho
     ws.add_chart(chart, anchor)
 
 
+def send_lead_to_logger(user_data: dict, result: dict, uploaded_files_info: list):
+    url = os.getenv("LEAD_LOGGER_URL")
+    if not url:
+        return
+
+    totals = result.get("totals", {})
+    analytics = result.get("analytics", {})
+
+    payload = {
+        "full_name": user_data.get("full_name", ""),
+        "email": user_data.get("email", ""),
+        "company_name": user_data.get("company_name", ""),
+        "phone_number": user_data.get("phone_number", ""),
+        "privacy_consent": user_data.get("privacy_consent", False),
+        "contact_consent": user_data.get("contact_consent", False),
+        "uploaded_files_count": len(uploaded_files_info),
+        "input_row_count": result.get("input_row_count", 0),
+        "total_kgco2e": totals.get("total_kgCO2e", 0),
+        "total_tco2e": totals.get("total_tCO2e", 0),
+        "top_category": (analytics.get("top_category_by_kgco2e") or {}).get("category", ""),
+        "top_site": (analytics.get("top_site_by_kgco2e") or {}).get("site_name", ""),
+        "source": "website_calculator"
+    }
+
+    try:
+        requests.post(url, json=payload, timeout=5)
+    except Exception as e:
+        print(f"Lead logger failed: {type(e).__name__}: {str(e)}")
+
+
 @app.post("/upload-calculate")
 async def upload_calculate(
     files: Annotated[List[UploadFile], File(description="Upload one or more CSV/XLSX activity datasets")],
@@ -236,6 +267,19 @@ async def upload_calculate(
             "phone_number": phone_number
         }
         result["analytics"] = build_analytics(result)
+
+        send_lead_to_logger(
+            {
+                "full_name": full_name,
+                "email": email,
+                "company_name": company_name,
+                "phone_number": phone_number,
+                "privacy_consent": True,
+                "contact_consent": True
+            },
+            result,
+            uploaded_files_info
+        )
 
         return result
 
@@ -290,6 +334,19 @@ async def upload_calculate_download(
             "phone_number": phone_number
         }
         result["analytics"] = build_analytics(result)
+
+        send_lead_to_logger(
+            {
+                "full_name": full_name,
+                "email": email,
+                "company_name": company_name,
+                "phone_number": phone_number,
+                "privacy_consent": True,
+                "contact_consent": True
+            },
+            result,
+            uploaded_files_info
+        )
 
         df_results = pd.DataFrame(result.get("line_items", []))
         df_errors = pd.DataFrame(result.get("errors", []))
