@@ -81,22 +81,65 @@ def normalize_uploaded_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def read_uploaded_file(uploaded_file: UploadFile) -> pd.DataFrame:
+def safe_string(value):
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def read_uploaded_file(uploaded_file: UploadFile):
     filename = (uploaded_file.filename or "").lower()
     content = uploaded_file.file.read()
+    file_warnings = []
 
-    if filename.endswith(".csv"):
-        df = pd.read_csv(BytesIO(content))
-    elif filename.endswith(".xlsx") or filename.endswith(".xls"):
-        df = pd.read_excel(BytesIO(content))
-    else:
+    try:
+        if filename.endswith(".csv"):
+            try:
+                df = pd.read_csv(
+                    BytesIO(content),
+                    dtype=str,
+                    keep_default_na=False,
+                    engine="python",
+                    on_bad_lines="skip"
+                )
+                file_warnings.append("CSV parsed in tolerant mode; malformed lines may have been skipped.")
+            except Exception as e:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Could not read CSV file '{uploaded_file.filename}': {type(e).__name__}: {str(e)}"
+                )
+
+        elif filename.endswith(".xlsx") or filename.endswith(".xls"):
+            try:
+                df = pd.read_excel(
+                    BytesIO(content),
+                    dtype=str
+                )
+            except Exception as e:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Could not read Excel file '{uploaded_file.filename}': {type(e).__name__}: {str(e)}"
+                )
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported file format for '{uploaded_file.filename}'. Please upload CSV or Excel files."
+            )
+
+        df = normalize_uploaded_columns(df)
+
+        if df.empty:
+            file_warnings.append("File was readable but contained no data rows.")
+
+        return df, file_warnings
+
+    except HTTPException:
+        raise
+    except Exception as e:
         raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported file format for '{uploaded_file.filename}'. Please upload CSV or Excel files."
+            status_code=500,
+            detail=f"Unexpected file read error for '{uploaded_file.filename}': {type(e).__name__}: {str(e)}"
         )
-
-    df = normalize_uploaded_columns(df)
-    return df
 
 
 def prepare_combined_dataframe(files: List[UploadFile]):
@@ -105,35 +148,180 @@ def prepare_combined_dataframe(files: List[UploadFile]):
 
     dataframes = []
     uploaded_files_info = []
-
-    for uploaded_file in files:
-        df = read_uploaded_file(uploaded_file)
-
-        if "source_file" not in df.columns:
-            df["source_file"] = uploaded_file.filename
-
-        dataframes.append(df)
-        uploaded_files_info.append({
-            "filename": uploaded_file.filename,
-            "rows": len(df),
-            "columns": list(df.columns)
-        })
-
-    combined_df = pd.concat(dataframes, ignore_index=True)
+    file_level_errors = []
 
     required_columns = ["category", "unit", "amount"]
-    missing_columns = [col for col in required_columns if col not in combined_df.columns]
-    if missing_columns:
+
+    for uploaded_file in files:
+        try:
+            df, file_warnings = read_uploaded_file(uploaded_file)
+
+            if "source_file" not in df.columns:
+                df["source_file"] = uploaded_file.filename
+
+            if "row_index_original" not in df.columns:
+                df["row_index_original"] = range(1, len(df) + 1)
+
+            missing_in_file = [col for col in required_columns if col not in df.columns]
+            for col in missing_in_file:
+                df[col] = ""
+
+            if missing_in_file:
+                file_level_errors.append({
+                    "source_file": uploaded_file.filename,
+                    "error": f"Missing required columns added as blank: {missing_in_file}"
+                })
+
+            for warning in file_warnings:
+                file_level_errors.append({
+                    "source_file": uploaded_file.filename,
+                    "error": warning
+                })
+
+            dataframes.append(df)
+            uploaded_files_info.append({
+                "filename": uploaded_file.filename,
+                "rows": len(df),
+                "columns": list(df.columns),
+                "missing_required_columns": missing_in_file
+            })
+
+        except HTTPException as e:
+            file_level_errors.append({
+                "source_file": uploaded_file.filename,
+                "error": f"{e.detail}"
+            })
+        except Exception as e:
+            file_level_errors.append({
+                "source_file": uploaded_file.filename,
+                "error": f"Failed to process file: {type(e).__name__}: {str(e)}"
+            })
+
+    if not dataframes:
         raise HTTPException(
             status_code=400,
             detail={
-                "message": f"Missing required columns: {missing_columns}",
-                "detected_columns": list(combined_df.columns)
+                "message": "None of the uploaded files could be processed.",
+                "file_level_errors": file_level_errors
             }
         )
 
-    combined_df_clean = preprocess_uploaded_dataframe(combined_df)
-    return combined_df_clean, uploaded_files_info
+    combined_df = pd.concat(dataframes, ignore_index=True)
+
+    try:
+        combined_df_clean = preprocess_uploaded_dataframe(combined_df)
+    except Exception as e:
+        file_level_errors.append({
+            "source_file": "preprocess_uploaded_dataframe",
+            "error": f"Preprocessing failed, using fallback normalization only: {type(e).__name__}: {str(e)}"
+        })
+        combined_df_clean = combined_df.copy()
+
+    for col in required_columns:
+        if col not in combined_df_clean.columns:
+            combined_df_clean[col] = ""
+
+    if "source_file" not in combined_df_clean.columns:
+        combined_df_clean["source_file"] = ""
+
+    if "row_index_original" not in combined_df_clean.columns:
+        combined_df_clean["row_index_original"] = range(1, len(combined_df_clean) + 1)
+
+    combined_df_clean = combined_df_clean.fillna("")
+
+    return combined_df_clean, uploaded_files_info, file_level_errors
+
+
+def safe_run_emissions_engine(activities: list):
+    """
+    Try running the engine on all activities.
+    If the engine crashes on messy data, fall back to row-by-row processing
+    so that a partial report can still be generated.
+    """
+    try:
+        result = run_emissions_engine({"activities": activities})
+        if not isinstance(result, dict):
+            raise ValueError("Engine did not return a dictionary.")
+        return result
+    except Exception as e:
+        fallback_errors = [{
+            "source_file": "engine",
+            "error": f"Bulk engine processing failed; falling back to row-by-row processing: {type(e).__name__}: {str(e)}"
+        }]
+
+        successful_line_items = []
+        collected_errors = []
+
+        for idx, activity in enumerate(activities):
+            try:
+                row_result = run_emissions_engine({"activities": [activity]})
+
+                row_line_items = row_result.get("line_items", [])
+                row_errors = row_result.get("errors", [])
+
+                if row_line_items:
+                    successful_line_items.extend(row_line_items)
+
+                if row_errors:
+                    collected_errors.extend(row_errors)
+
+            except Exception as row_error:
+                collected_errors.append({
+                    "row_index": activity.get("row_index_original", idx + 1),
+                    "source_file": activity.get("source_file", ""),
+                    "error": f"Row processing failed: {type(row_error).__name__}: {str(row_error)}"
+                })
+
+        result = build_result_from_line_items(successful_line_items, collected_errors + fallback_errors)
+        return result
+
+
+def build_result_from_line_items(line_items: list, errors: list):
+    df_results = pd.DataFrame(line_items) if line_items else pd.DataFrame()
+
+    total_kg = 0.0
+    total_t = 0.0
+    summary_by_scope = []
+    summary_by_scope_category = []
+
+    if not df_results.empty and "emissions_kgCO2e" in df_results.columns:
+        df_results["emissions_kgCO2e"] = pd.to_numeric(df_results["emissions_kgCO2e"], errors="coerce").fillna(0)
+
+        total_kg = round(float(df_results["emissions_kgCO2e"].sum()), 4)
+        total_t = round(total_kg / 1000, 4)
+
+        if "scope" in df_results.columns:
+            df_scope = (
+                df_results.groupby("scope", as_index=False)["emissions_kgCO2e"]
+                .sum()
+                .sort_values("emissions_kgCO2e", ascending=False)
+            )
+            if not df_scope.empty:
+                df_scope["emissions_tCO2e"] = (df_scope["emissions_kgCO2e"] / 1000).round(4)
+                df_scope["emissions_kgCO2e"] = df_scope["emissions_kgCO2e"].round(4)
+                summary_by_scope = df_scope.to_dict(orient="records")
+
+        if "scope" in df_results.columns and "category" in df_results.columns:
+            df_scope_cat = (
+                df_results.groupby(["scope", "category"], as_index=False)["emissions_kgCO2e"]
+                .sum()
+                .sort_values("emissions_kgCO2e", ascending=False)
+            )
+            if not df_scope_cat.empty:
+                df_scope_cat["emissions_tCO2e"] = (df_scope_cat["emissions_kgCO2e"] / 1000).round(4)
+                df_scope_cat["emissions_kgCO2e"] = df_scope_cat["emissions_kgCO2e"].round(4)
+                summary_by_scope_category = df_scope_cat.to_dict(orient="records")
+
+    return {
+        "totals": {
+            "total_kgCO2e": total_kg,
+            "total_tCO2e": total_t
+        },
+        "summary_by_scope": summary_by_scope,
+        "summary_by_scope_category": summary_by_scope_category,
+        "line_items": line_items,
+        "errors": errors
+    }
 
 
 def build_analytics(result: dict) -> dict:
@@ -144,9 +332,13 @@ def build_analytics(result: dict) -> dict:
         analytics["average_emissions_per_row_kgco2e"] = 0
         return analytics
 
-    analytics["average_emissions_per_row_kgco2e"] = round(
-        float(df_results["emissions_kgCO2e"].mean()), 4
-    )
+    if "emissions_kgCO2e" in df_results.columns:
+        df_results["emissions_kgCO2e"] = pd.to_numeric(df_results["emissions_kgCO2e"], errors="coerce").fillna(0)
+        analytics["average_emissions_per_row_kgco2e"] = round(
+            float(df_results["emissions_kgCO2e"].mean()), 4
+        )
+    else:
+        analytics["average_emissions_per_row_kgco2e"] = 0
 
     if "category" in df_results.columns:
         df_cat = (
@@ -162,7 +354,7 @@ def build_analytics(result: dict) -> dict:
 
     if "site_name" in df_results.columns and df_results["site_name"].notna().any():
         df_site = (
-            df_results.dropna(subset=["site_name"])
+            df_results[df_results["site_name"].astype(str).str.strip() != ""]
             .groupby("site_name", as_index=False)["emissions_kgCO2e"]
             .sum()
             .sort_values("emissions_kgCO2e", ascending=False)
@@ -175,7 +367,7 @@ def build_analytics(result: dict) -> dict:
 
     if "reporting_period" in df_results.columns and df_results["reporting_period"].notna().any():
         df_period = (
-            df_results.dropna(subset=["reporting_period"])
+            df_results[df_results["reporting_period"].astype(str).str.strip() != ""]
             .groupby("reporting_period", as_index=False)["emissions_kgCO2e"]
             .sum()
             .sort_values("reporting_period")
@@ -193,7 +385,7 @@ def build_error_summary(errors: list) -> list:
     if "error" not in df_errors.columns:
         return []
 
-    grouped = df_errors["error"].value_counts().reset_index()
+    grouped = df_errors["error"].astype(str).value_counts().reset_index()
     grouped.columns = ["error", "count"]
 
     return grouped.to_dict(orient="records")
@@ -276,26 +468,28 @@ async def upload_calculate(
         if str(contact_consent).lower() != "true":
             raise HTTPException(status_code=400, detail="Contact consent is required.")
 
-        if not full_name.strip():
+        if not safe_string(full_name):
             raise HTTPException(status_code=400, detail="Full name is required.")
 
-        if not email.strip():
+        if not safe_string(email):
             raise HTTPException(status_code=400, detail="Email is required.")
 
-        if not company_name.strip():
+        if not safe_string(company_name):
             raise HTTPException(status_code=400, detail="Company name is required.")
 
-        if not phone_number.strip():
+        if not safe_string(phone_number):
             raise HTTPException(status_code=400, detail="Phone number is required.")
 
-        combined_df_clean, uploaded_files_info = prepare_combined_dataframe(files)
+        combined_df_clean, uploaded_files_info, file_level_errors = prepare_combined_dataframe(files)
 
         activities = combined_df_clean.to_dict(orient="records")
-        full_result = run_emissions_engine({"activities": activities})
+        full_result = safe_run_emissions_engine(activities)
 
         analytics = build_analytics(full_result)
-        errors = full_result.get("errors", [])
-        error_summary = build_error_summary(errors)
+
+        row_errors = full_result.get("errors", [])
+        all_errors = file_level_errors + row_errors
+        error_summary = build_error_summary(all_errors)
 
         result = {
             "totals": full_result.get("totals", {}),
@@ -312,8 +506,8 @@ async def upload_calculate(
                 "phone_number": phone_number
             },
             "analytics": analytics,
-            "error_count": len(errors),
-            "errors_preview": errors[:20],
+            "error_count": len(all_errors),
+            "errors_preview": all_errors[:50],
             "error_summary": error_summary
         }
 
@@ -359,23 +553,24 @@ async def upload_calculate_download(
         if str(contact_consent).lower() != "true":
             raise HTTPException(status_code=400, detail="Contact consent is required.")
 
-        if not full_name.strip():
+        if not safe_string(full_name):
             raise HTTPException(status_code=400, detail="Full name is required.")
 
-        if not email.strip():
+        if not safe_string(email):
             raise HTTPException(status_code=400, detail="Email is required.")
 
-        if not company_name.strip():
+        if not safe_string(company_name):
             raise HTTPException(status_code=400, detail="Company name is required.")
 
-        if not phone_number.strip():
+        if not safe_string(phone_number):
             raise HTTPException(status_code=400, detail="Phone number is required.")
 
-        combined_df_clean, uploaded_files_info = prepare_combined_dataframe(files)
+        combined_df_clean, uploaded_files_info, file_level_errors = prepare_combined_dataframe(files)
 
         activities = combined_df_clean.to_dict(orient="records")
-        result = run_emissions_engine({"activities": activities})
+        result = safe_run_emissions_engine(activities)
 
+        result["errors"] = file_level_errors + result.get("errors", [])
         result["uploaded_files"] = uploaded_files_info
         result["input_row_count"] = len(combined_df_clean)
         result["privacy_consent"] = True
@@ -468,28 +663,24 @@ async def upload_calculate_download(
                 except Exception:
                     pass
 
-            # Scope data
             chart_ws["A6"] = "Scope"
             chart_ws["B6"] = "kg CO2e"
             for i, row in enumerate(result.get("summary_by_scope", []), start=7):
                 chart_ws[f"A{i}"] = row.get("scope")
                 chart_ws[f"B{i}"] = row.get("emissions_kgCO2e")
 
-            # Scope/category data
             chart_ws["D6"] = "Category"
             chart_ws["E6"] = "kg CO2e"
             for i, row in enumerate(result.get("summary_by_scope_category", []), start=7):
                 chart_ws[f"D{i}"] = f"{row.get('scope')} - {row.get('category')}"
                 chart_ws[f"E{i}"] = row.get("emissions_kgCO2e")
 
-            # Pie source from scope summary
             chart_ws["J6"] = "Scope"
             chart_ws["K6"] = "kg CO2e"
             for i, row in enumerate(result.get("summary_by_scope", []), start=7):
                 chart_ws[f"J{i}"] = row.get("scope")
                 chart_ws[f"K{i}"] = row.get("emissions_kgCO2e")
 
-            # Pie source from scope/category summary
             chart_ws["N6"] = "Category"
             chart_ws["O6"] = "kg CO2e"
             for i, row in enumerate(result.get("summary_by_scope_category", []), start=7):
