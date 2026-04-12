@@ -9,7 +9,7 @@ import os
 import requests
 
 from openpyxl.drawing.image import Image as XLImage
-from openpyxl.chart import BarChart, Reference
+from openpyxl.chart import BarChart, PieChart, Reference
 
 from engine import run_emissions_engine, preprocess_uploaded_dataframe
 
@@ -173,10 +173,33 @@ def build_analytics(result: dict) -> dict:
                 "emissions_kgCO2e": round(float(df_site.iloc[0]["emissions_kgCO2e"]), 4)
             }
 
+    if "reporting_period" in df_results.columns and df_results["reporting_period"].notna().any():
+        df_period = (
+            df_results.dropna(subset=["reporting_period"])
+            .groupby("reporting_period", as_index=False)["emissions_kgCO2e"]
+            .sum()
+            .sort_values("reporting_period")
+        )
+        analytics["period_trend"] = df_period.to_dict(orient="records")
+
     return analytics
 
 
-def add_excel_chart(ws, title, data_col, category_col, start_row, end_row, anchor):
+def build_error_summary(errors: list) -> list:
+    if not errors:
+        return []
+
+    df_errors = pd.DataFrame(errors)
+    if "error" not in df_errors.columns:
+        return []
+
+    grouped = df_errors["error"].value_counts().reset_index()
+    grouped.columns = ["error", "count"]
+
+    return grouped.to_dict(orient="records")
+
+
+def add_bar_chart(ws, title, data_col, category_col, start_row, end_row, anchor):
     chart = BarChart()
     chart.title = title
     chart.y_axis.title = "kg CO2e"
@@ -189,6 +212,20 @@ def add_excel_chart(ws, title, data_col, category_col, start_row, end_row, ancho
     chart.set_categories(categories)
     chart.height = 8
     chart.width = 16
+    ws.add_chart(chart, anchor)
+
+
+def add_pie_chart(ws, title, data_col, category_col, start_row, end_row, anchor):
+    chart = PieChart()
+    chart.title = title
+
+    data = Reference(ws, min_col=data_col, min_row=start_row, max_row=end_row)
+    labels = Reference(ws, min_col=category_col, min_row=start_row + 1, max_row=end_row)
+
+    chart.add_data(data, titles_from_data=True)
+    chart.set_categories(labels)
+    chart.height = 8
+    chart.width = 12
     ws.add_chart(chart, anchor)
 
 
@@ -254,19 +291,31 @@ async def upload_calculate(
         combined_df_clean, uploaded_files_info = prepare_combined_dataframe(files)
 
         activities = combined_df_clean.to_dict(orient="records")
-        result = run_emissions_engine({"activities": activities})
+        full_result = run_emissions_engine({"activities": activities})
 
-        result["uploaded_files"] = uploaded_files_info
-        result["input_row_count"] = len(combined_df_clean)
-        result["privacy_consent"] = True
-        result["contact_consent"] = True
-        result["user"] = {
-            "full_name": full_name,
-            "email": email,
-            "company_name": company_name,
-            "phone_number": phone_number
+        analytics = build_analytics(full_result)
+        errors = full_result.get("errors", [])
+        error_summary = build_error_summary(errors)
+
+        result = {
+            "totals": full_result.get("totals", {}),
+            "summary_by_scope": full_result.get("summary_by_scope", []),
+            "summary_by_scope_category": full_result.get("summary_by_scope_category", []),
+            "uploaded_files": uploaded_files_info,
+            "input_row_count": len(combined_df_clean),
+            "privacy_consent": True,
+            "contact_consent": True,
+            "user": {
+                "full_name": full_name,
+                "email": email,
+                "company_name": company_name,
+                "phone_number": phone_number
+            },
+            "analytics": analytics,
+            "error_count": len(errors),
+            "errors_preview": errors[:20],
+            "error_summary": error_summary
         }
-        result["analytics"] = build_analytics(result)
 
         send_lead_to_logger(
             {
@@ -277,7 +326,11 @@ async def upload_calculate(
                 "privacy_consent": True,
                 "contact_consent": True
             },
-            result,
+            {
+                "totals": full_result.get("totals", {}),
+                "analytics": analytics,
+                "input_row_count": len(combined_df_clean)
+            },
             uploaded_files_info
         )
 
@@ -357,6 +410,7 @@ async def upload_calculate_download(
             [{"metric": k, "value": str(v)} for k, v in result.get("analytics", {}).items()]
         )
         df_user = pd.DataFrame([result["user"]])
+        df_error_summary = pd.DataFrame(build_error_summary(result.get("errors", [])))
 
         totals = result.get("totals", {})
         df_overview = pd.DataFrame([{
@@ -376,6 +430,7 @@ async def upload_calculate_download(
             df_summary_scope_cat.to_excel(writer, sheet_name="Summary by Category", index=False, startrow=6)
             df_results.to_excel(writer, sheet_name="Results", index=False, startrow=6)
             df_errors.to_excel(writer, sheet_name="Errors", index=False, startrow=6)
+            df_error_summary.to_excel(writer, sheet_name="Error Summary", index=False, startrow=6)
             df_uploaded_files.to_excel(writer, sheet_name="Uploaded Files", index=False, startrow=6)
             df_analytics.to_excel(writer, sheet_name="Analytics", index=False, startrow=6)
             df_user.to_excel(writer, sheet_name="User Details", index=False, startrow=6)
@@ -413,20 +468,36 @@ async def upload_calculate_download(
                 except Exception:
                     pass
 
+            # Scope data
             chart_ws["A6"] = "Scope"
             chart_ws["B6"] = "kg CO2e"
             for i, row in enumerate(result.get("summary_by_scope", []), start=7):
                 chart_ws[f"A{i}"] = row.get("scope")
                 chart_ws[f"B{i}"] = row.get("emissions_kgCO2e")
 
+            # Scope/category data
             chart_ws["D6"] = "Category"
             chart_ws["E6"] = "kg CO2e"
             for i, row in enumerate(result.get("summary_by_scope_category", []), start=7):
                 chart_ws[f"D{i}"] = f"{row.get('scope')} - {row.get('category')}"
                 chart_ws[f"E{i}"] = row.get("emissions_kgCO2e")
 
+            # Pie source from scope summary
+            chart_ws["J6"] = "Scope"
+            chart_ws["K6"] = "kg CO2e"
+            for i, row in enumerate(result.get("summary_by_scope", []), start=7):
+                chart_ws[f"J{i}"] = row.get("scope")
+                chart_ws[f"K{i}"] = row.get("emissions_kgCO2e")
+
+            # Pie source from scope/category summary
+            chart_ws["N6"] = "Category"
+            chart_ws["O6"] = "kg CO2e"
+            for i, row in enumerate(result.get("summary_by_scope_category", []), start=7):
+                chart_ws[f"N{i}"] = f"{row.get('scope')} - {row.get('category')}"
+                chart_ws[f"O{i}"] = row.get("emissions_kgCO2e")
+
             if len(result.get("summary_by_scope", [])) > 0:
-                add_excel_chart(
+                add_bar_chart(
                     chart_ws,
                     "Emissions by Scope",
                     2,
@@ -436,8 +507,18 @@ async def upload_calculate_download(
                     "G6"
                 )
 
+                add_pie_chart(
+                    chart_ws,
+                    "Scope Share",
+                    11,
+                    10,
+                    6,
+                    6 + len(result.get("summary_by_scope", [])),
+                    "Q6"
+                )
+
             if len(result.get("summary_by_scope_category", [])) > 0:
-                add_excel_chart(
+                add_bar_chart(
                     chart_ws,
                     "Emissions by Scope and Category",
                     5,
@@ -445,6 +526,16 @@ async def upload_calculate_download(
                     6,
                     6 + len(result.get("summary_by_scope_category", [])),
                     "G24"
+                )
+
+                add_pie_chart(
+                    chart_ws,
+                    "Category Share",
+                    15,
+                    14,
+                    6,
+                    6 + len(result.get("summary_by_scope_category", [])),
+                    "Q24"
                 )
 
         output.seek(0)
