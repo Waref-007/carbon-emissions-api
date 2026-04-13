@@ -233,11 +233,6 @@ def prepare_combined_dataframe(files: List[UploadFile]):
 
 
 def safe_run_emissions_engine(activities: list):
-    """
-    Try running the engine on all activities.
-    If the engine crashes on messy data, fall back to row-by-row processing
-    so that a partial report can still be generated.
-    """
     try:
         result = run_emissions_engine({"activities": activities})
         if not isinstance(result, dict):
@@ -251,6 +246,16 @@ def safe_run_emissions_engine(activities: list):
 
         successful_line_items = []
         collected_errors = []
+        all_factor_rows = []
+        all_unmapped_categories = []
+        best_data_quality = {
+            "total_rows": len(activities),
+            "successful_rows": 0,
+            "errored_rows": 0,
+            "coverage_percent": 0,
+            "mapped_category_rows": 0,
+            "inferred_category_rows": 0
+        }
 
         for idx, activity in enumerate(activities):
             try:
@@ -258,12 +263,27 @@ def safe_run_emissions_engine(activities: list):
 
                 row_line_items = row_result.get("line_items", [])
                 row_errors = row_result.get("errors", [])
+                row_factors = row_result.get("factor_transparency", [])
+                row_unmapped = row_result.get("unmapped_categories", [])
+                row_quality = row_result.get("data_quality", {})
 
                 if row_line_items:
                     successful_line_items.extend(row_line_items)
 
                 if row_errors:
                     collected_errors.extend(row_errors)
+
+                if row_factors:
+                    all_factor_rows.extend(row_factors)
+
+                if row_unmapped:
+                    all_unmapped_categories.extend(row_unmapped)
+
+                if row_quality:
+                    best_data_quality["successful_rows"] += int(row_quality.get("successful_rows", 0))
+                    best_data_quality["errored_rows"] += int(row_quality.get("errored_rows", 0))
+                    best_data_quality["mapped_category_rows"] += int(row_quality.get("mapped_category_rows", 0))
+                    best_data_quality["inferred_category_rows"] += int(row_quality.get("inferred_category_rows", 0))
 
             except Exception as row_error:
                 collected_errors.append({
@@ -272,11 +292,28 @@ def safe_run_emissions_engine(activities: list):
                     "error": f"Row processing failed: {type(row_error).__name__}: {str(row_error)}"
                 })
 
-        result = build_result_from_line_items(successful_line_items, collected_errors + fallback_errors)
+        if best_data_quality["total_rows"] > 0:
+            best_data_quality["coverage_percent"] = round(
+                (best_data_quality["successful_rows"] / best_data_quality["total_rows"]) * 100, 2
+            )
+
+        result = build_result_from_line_items(
+            line_items=successful_line_items,
+            errors=collected_errors + fallback_errors,
+            data_quality=best_data_quality,
+            unmapped_categories=all_unmapped_categories,
+            factor_transparency=all_factor_rows
+        )
         return result
 
 
-def build_result_from_line_items(line_items: list, errors: list):
+def build_result_from_line_items(
+    line_items: list,
+    errors: list,
+    data_quality: dict | None = None,
+    unmapped_categories: list | None = None,
+    factor_transparency: list | None = None
+):
     df_results = pd.DataFrame(line_items) if line_items else pd.DataFrame()
 
     total_kg = 0.0
@@ -320,7 +357,10 @@ def build_result_from_line_items(line_items: list, errors: list):
         "summary_by_scope": summary_by_scope,
         "summary_by_scope_category": summary_by_scope_category,
         "line_items": line_items,
-        "errors": errors
+        "errors": errors,
+        "data_quality": data_quality or {},
+        "unmapped_categories": unmapped_categories or [],
+        "factor_transparency": factor_transparency or []
     }
 
 
@@ -508,9 +548,13 @@ async def upload_calculate(
             "analytics": analytics,
             "error_count": len(all_errors),
             "errors_preview": all_errors[:50],
-            "error_summary": error_summary
+            "error_summary": error_summary,
+            "data_quality": full_result.get("data_quality", {}),
+            "unmapped_categories": full_result.get("unmapped_categories", []),
+            "factor_transparency": full_result.get("factor_transparency", [])
         }
 
+        # Lead logging happens only here.
         send_lead_to_logger(
             {
                 "full_name": full_name,
@@ -582,19 +626,9 @@ async def upload_calculate_download(
             "phone_number": phone_number
         }
         result["analytics"] = build_analytics(result)
-
-        send_lead_to_logger(
-            {
-                "full_name": full_name,
-                "email": email,
-                "company_name": company_name,
-                "phone_number": phone_number,
-                "privacy_consent": True,
-                "contact_consent": True
-            },
-            result,
-            uploaded_files_info
-        )
+        result["data_quality"] = result.get("data_quality", {})
+        result["unmapped_categories"] = result.get("unmapped_categories", [])
+        result["factor_transparency"] = result.get("factor_transparency", [])
 
         df_results = pd.DataFrame(result.get("line_items", []))
         df_errors = pd.DataFrame(result.get("errors", []))
@@ -606,6 +640,9 @@ async def upload_calculate_download(
         )
         df_user = pd.DataFrame([result["user"]])
         df_error_summary = pd.DataFrame(build_error_summary(result.get("errors", [])))
+        df_data_quality = pd.DataFrame([result.get("data_quality", {})]) if result.get("data_quality") else pd.DataFrame()
+        df_unmapped_categories = pd.DataFrame(result.get("unmapped_categories", []))
+        df_factor_transparency = pd.DataFrame(result.get("factor_transparency", []))
 
         totals = result.get("totals", {})
         df_overview = pd.DataFrame([{
@@ -629,6 +666,9 @@ async def upload_calculate_download(
             df_uploaded_files.to_excel(writer, sheet_name="Uploaded Files", index=False, startrow=6)
             df_analytics.to_excel(writer, sheet_name="Analytics", index=False, startrow=6)
             df_user.to_excel(writer, sheet_name="User Details", index=False, startrow=6)
+            df_data_quality.to_excel(writer, sheet_name="Data Quality", index=False, startrow=6)
+            df_unmapped_categories.to_excel(writer, sheet_name="Unmapped Categories", index=False, startrow=6)
+            df_factor_transparency.to_excel(writer, sheet_name="Factor Transparency", index=False, startrow=6)
 
             workbook = writer.book
 
