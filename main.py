@@ -4,17 +4,24 @@ from fastapi.responses import StreamingResponse
 from typing import List, Annotated
 from io import BytesIO
 import io
-import pandas as pd
 import os
+import re
 import requests
+import pandas as pd
 
 from openpyxl.drawing.image import Image as XLImage
 from openpyxl.chart import BarChart, PieChart, Reference
+from openpyxl.styles import Font, PatternFill
+from openpyxl.utils import get_column_letter
 
 from engine import run_emissions_engine, preprocess_uploaded_dataframe
 
 app = FastAPI(title="Carbon Emissions API")
 
+
+# =========================
+# CORS
+# =========================
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -27,6 +34,9 @@ app.add_middleware(
 )
 
 
+# =========================
+# BASIC ROUTES
+# =========================
 @app.get("/")
 def root():
     return {"status": "ok", "message": "Carbon emissions API is running"}
@@ -50,26 +60,22 @@ def debug_routes():
             "/health",
             "/calculate",
             "/upload-calculate",
-            "/upload-calculate-download"
+            "/upload-calculate-download",
         ]
     }
 
 
-@app.post("/calculate")
-def calculate(payload: dict):
-    try:
-        activities = payload.get("activities", [])
+# =========================
+# GENERAL HELPERS
+# =========================
+def safe_string(value):
+    if value is None:
+        return ""
+    return str(value).strip()
 
-        if not isinstance(activities, list):
-            raise HTTPException(status_code=400, detail="activities must be a list")
 
-        result = run_emissions_engine({"activities": activities})
-        return result
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {str(e)}")
+def to_bool_string_true(value: str) -> bool:
+    return str(value).strip().lower() == "true"
 
 
 def normalize_uploaded_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -81,12 +87,203 @@ def normalize_uploaded_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def safe_string(value):
-    if value is None:
-        return ""
-    return str(value).strip()
+def sanitize_sheet_name(name: str) -> str:
+    if not name:
+        return "Sheet"
+    cleaned = re.sub(r"[\\/*?:\[\]]", "", str(name)).strip()
+    return cleaned[:31] if cleaned else "Sheet"
 
 
+def auto_fit_columns(ws, min_width=12, max_width=45):
+    for col_cells in ws.columns:
+        length = 0
+        col_letter = get_column_letter(col_cells[0].column)
+        for cell in col_cells:
+            try:
+                value = "" if cell.value is None else str(cell.value)
+                length = max(length, len(value))
+            except Exception:
+                pass
+        ws.column_dimensions[col_letter].width = min(max(length + 2, min_width), max_width)
+
+
+def style_report_sheet(ws, title="GS Carbon Emissions Report", subtitle="Generated from uploaded datasets"):
+    ws["A1"] = title
+    ws["A2"] = subtitle
+    ws["A3"] = "Aligned with GHG Protocol and DEFRA 2025"
+
+    ws["A1"].font = Font(size=16, bold=True)
+    ws["A2"].font = Font(size=11, italic=True)
+    ws["A3"].font = Font(size=10)
+
+    header_fill = PatternFill(fill_type="solid", start_color="D9EAD3", end_color="D9EAD3")
+
+    for cell in ws[7]:
+        cell.font = Font(bold=True)
+        cell.fill = header_fill
+
+    logo_path = "logo.png"
+    if os.path.exists(logo_path):
+        try:
+            logo = XLImage(logo_path)
+            logo.width = 140
+            logo.height = 70
+            ws.add_image(logo, "L1")
+        except Exception:
+            pass
+
+
+def add_bar_chart(ws, title, data_col, category_col, start_row, end_row, anchor):
+    if end_row <= start_row:
+        return
+
+    chart = BarChart()
+    chart.title = title
+    chart.y_axis.title = "kg CO2e"
+    chart.x_axis.title = "Category"
+
+    data = Reference(ws, min_col=data_col, min_row=start_row, max_row=end_row)
+    categories = Reference(ws, min_col=category_col, min_row=start_row + 1, max_row=end_row)
+
+    chart.add_data(data, titles_from_data=True)
+    chart.set_categories(categories)
+    chart.height = 8
+    chart.width = 16
+    ws.add_chart(chart, anchor)
+
+
+def add_pie_chart(ws, title, data_col, category_col, start_row, end_row, anchor):
+    if end_row <= start_row:
+        return
+
+    chart = PieChart()
+    chart.title = title
+
+    data = Reference(ws, min_col=data_col, min_row=start_row, max_row=end_row)
+    labels = Reference(ws, min_col=category_col, min_row=start_row + 1, max_row=end_row)
+
+    chart.add_data(data, titles_from_data=True)
+    chart.set_categories(labels)
+    chart.height = 8
+    chart.width = 12
+    ws.add_chart(chart, anchor)
+
+
+def build_error_summary(errors: list) -> list:
+    if not errors:
+        return []
+
+    df_errors = pd.DataFrame(errors)
+    if "error" not in df_errors.columns:
+        return []
+
+    grouped = df_errors["error"].astype(str).value_counts().reset_index()
+    grouped.columns = ["error", "count"]
+    return grouped.to_dict(orient="records")
+
+
+def build_analytics_from_line_items(result: dict) -> dict:
+    """
+    Fallback analytics builder.
+    Used only when the engine did not already return analytics.
+    """
+    existing = result.get("analytics")
+    if isinstance(existing, dict) and existing:
+        return existing
+
+    df_results = pd.DataFrame(result.get("line_items", []))
+    analytics = {}
+
+    if df_results.empty:
+        analytics["average_emissions_per_row_kgco2e"] = 0
+        return analytics
+
+    if "emissions_kgCO2e" in df_results.columns:
+        df_results["emissions_kgCO2e"] = pd.to_numeric(df_results["emissions_kgCO2e"], errors="coerce").fillna(0)
+        analytics["average_emissions_per_row_kgco2e"] = round(
+            float(df_results["emissions_kgCO2e"].mean()), 4
+        )
+    else:
+        analytics["average_emissions_per_row_kgco2e"] = 0
+
+    if "category" in df_results.columns:
+        df_cat = (
+            df_results.groupby("category", as_index=False)["emissions_kgCO2e"]
+            .sum()
+            .sort_values("emissions_kgCO2e", ascending=False)
+        )
+        if not df_cat.empty:
+            analytics["top_category_by_kgco2e"] = {
+                "category": df_cat.iloc[0]["category"],
+                "emissions_kgCO2e": round(float(df_cat.iloc[0]["emissions_kgCO2e"]), 4)
+            }
+            analytics["top_categories_by_kgco2e"] = df_cat.head(5).to_dict(orient="records")
+
+    if "site_name" in df_results.columns and df_results["site_name"].notna().any():
+        df_site = (
+            df_results[df_results["site_name"].astype(str).str.strip() != ""]
+            .groupby("site_name", as_index=False)["emissions_kgCO2e"]
+            .sum()
+            .sort_values("emissions_kgCO2e", ascending=False)
+        )
+        if not df_site.empty:
+            analytics["top_site_by_kgco2e"] = {
+                "site_name": df_site.iloc[0]["site_name"],
+                "emissions_kgCO2e": round(float(df_site.iloc[0]["emissions_kgCO2e"]), 4)
+            }
+            analytics["top_sites_by_kgco2e"] = df_site.head(5).to_dict(orient="records")
+
+    if "reporting_period" in df_results.columns and df_results["reporting_period"].notna().any():
+        df_period = (
+            df_results[df_results["reporting_period"].astype(str).str.strip() != ""]
+            .groupby("reporting_period", as_index=False)["emissions_kgCO2e"]
+            .sum()
+            .sort_values("reporting_period")
+        )
+        analytics["period_trend"] = df_period.to_dict(orient="records")
+
+    return analytics
+
+
+def validate_user_inputs(
+    privacy_consent: str,
+    contact_consent: str,
+    full_name: str,
+    email: str,
+    company_name: str,
+    phone_number: str,
+):
+    if not to_bool_string_true(privacy_consent):
+        raise HTTPException(status_code=400, detail="Privacy consent is required.")
+
+    if not to_bool_string_true(contact_consent):
+        raise HTTPException(status_code=400, detail="Contact consent is required.")
+
+    if not safe_string(full_name):
+        raise HTTPException(status_code=400, detail="Full name is required.")
+
+    if not safe_string(email):
+        raise HTTPException(status_code=400, detail="Email is required.")
+
+    if not safe_string(company_name):
+        raise HTTPException(status_code=400, detail="Company name is required.")
+
+    if not safe_string(phone_number):
+        raise HTTPException(status_code=400, detail="Phone number is required.")
+
+
+def build_user_object(full_name, email, company_name, phone_number):
+    return {
+        "full_name": full_name,
+        "email": email,
+        "company_name": company_name,
+        "phone_number": phone_number
+    }
+
+
+# =========================
+# FILE READING
+# =========================
 def read_uploaded_file(uploaded_file: UploadFile):
     filename = (uploaded_file.filename or "").lower()
     content = uploaded_file.file.read()
@@ -111,10 +308,7 @@ def read_uploaded_file(uploaded_file: UploadFile):
 
         elif filename.endswith(".xlsx") or filename.endswith(".xls"):
             try:
-                df = pd.read_excel(
-                    BytesIO(content),
-                    dtype=str
-                )
+                df = pd.read_excel(BytesIO(content), dtype=str)
             except Exception as e:
                 raise HTTPException(
                     status_code=400,
@@ -232,12 +426,78 @@ def prepare_combined_dataframe(files: List[UploadFile]):
     return combined_df_clean, uploaded_files_info, file_level_errors
 
 
+# =========================
+# ENGINE SAFE WRAPPER
+# =========================
+def build_result_from_line_items(
+    line_items: list,
+    errors: list,
+    data_quality: dict | None = None,
+    unmapped_categories: list | None = None,
+    factor_transparency: list | None = None
+):
+    df_results = pd.DataFrame(line_items) if line_items else pd.DataFrame()
+
+    total_kg = 0.0
+    total_t = 0.0
+    summary_by_scope = []
+    summary_by_scope_category = []
+
+    if not df_results.empty and "emissions_kgCO2e" in df_results.columns:
+        df_results["emissions_kgCO2e"] = pd.to_numeric(df_results["emissions_kgCO2e"], errors="coerce").fillna(0)
+
+        total_kg = round(float(df_results["emissions_kgCO2e"].sum()), 4)
+        total_t = round(total_kg / 1000, 4)
+
+        if "scope" in df_results.columns:
+            df_scope = (
+                df_results.groupby("scope", as_index=False)["emissions_kgCO2e"]
+                .sum()
+                .sort_values("emissions_kgCO2e", ascending=False)
+            )
+            if not df_scope.empty:
+                df_scope["emissions_tCO2e"] = (df_scope["emissions_kgCO2e"] / 1000).round(4)
+                total_scope_kg = float(df_scope["emissions_kgCO2e"].sum()) if not df_scope.empty else 0.0
+                df_scope["percent_of_total"] = df_scope["emissions_kgCO2e"].apply(
+                    lambda x: round((float(x) / total_scope_kg) * 100, 2) if total_scope_kg > 0 else 0.0
+                )
+                df_scope["emissions_kgCO2e"] = df_scope["emissions_kgCO2e"].round(4)
+                summary_by_scope = df_scope.to_dict(orient="records")
+
+        if "scope" in df_results.columns and "category" in df_results.columns:
+            df_scope_cat = (
+                df_results.groupby(["scope", "category"], as_index=False)["emissions_kgCO2e"]
+                .sum()
+                .sort_values("emissions_kgCO2e", ascending=False)
+            )
+            if not df_scope_cat.empty:
+                df_scope_cat["emissions_tCO2e"] = (df_scope_cat["emissions_kgCO2e"] / 1000).round(4)
+                df_scope_cat["emissions_kgCO2e"] = df_scope_cat["emissions_kgCO2e"].round(4)
+                summary_by_scope_category = df_scope_cat.to_dict(orient="records")
+
+    return {
+        "totals": {
+            "total_kgCO2e": total_kg,
+            "total_tCO2e": total_t
+        },
+        "summary_by_scope": summary_by_scope,
+        "summary_by_scope_category": summary_by_scope_category,
+        "line_items": line_items,
+        "errors": errors,
+        "data_quality": data_quality or {},
+        "unmapped_categories": unmapped_categories or [],
+        "factor_transparency": factor_transparency or [],
+        "analytics": build_analytics_from_line_items({"line_items": line_items})
+    }
+
+
 def safe_run_emissions_engine(activities: list):
     try:
         result = run_emissions_engine({"activities": activities})
         if not isinstance(result, dict):
             raise ValueError("Engine did not return a dictionary.")
         return result
+
     except Exception as e:
         fallback_errors = [{
             "source_file": "engine",
@@ -254,7 +514,13 @@ def safe_run_emissions_engine(activities: list):
             "errored_rows": 0,
             "coverage_percent": 0,
             "mapped_category_rows": 0,
-            "inferred_category_rows": 0
+            "inferred_category_rows": 0,
+            "exact_factor_rows": 0,
+            "estimated_rows": 0,
+            "official_factor_rows": 0,
+            "starter_factor_rows": 0,
+            "valid_rows_percent": 0,
+            "invalid_rows_percent": 0
         }
 
         for idx, activity in enumerate(activities):
@@ -284,6 +550,10 @@ def safe_run_emissions_engine(activities: list):
                     best_data_quality["errored_rows"] += int(row_quality.get("errored_rows", 0))
                     best_data_quality["mapped_category_rows"] += int(row_quality.get("mapped_category_rows", 0))
                     best_data_quality["inferred_category_rows"] += int(row_quality.get("inferred_category_rows", 0))
+                    best_data_quality["exact_factor_rows"] += int(row_quality.get("exact_factor_rows", 0))
+                    best_data_quality["estimated_rows"] += int(row_quality.get("estimated_rows", 0))
+                    best_data_quality["official_factor_rows"] += int(row_quality.get("official_factor_rows", 0))
+                    best_data_quality["starter_factor_rows"] += int(row_quality.get("starter_factor_rows", 0))
 
             except Exception as row_error:
                 collected_errors.append({
@@ -296,6 +566,12 @@ def safe_run_emissions_engine(activities: list):
             best_data_quality["coverage_percent"] = round(
                 (best_data_quality["successful_rows"] / best_data_quality["total_rows"]) * 100, 2
             )
+            best_data_quality["valid_rows_percent"] = round(
+                (best_data_quality["successful_rows"] / best_data_quality["total_rows"]) * 100, 2
+            )
+            best_data_quality["invalid_rows_percent"] = round(
+                (best_data_quality["errored_rows"] / best_data_quality["total_rows"]) * 100, 2
+            )
 
         result = build_result_from_line_items(
             line_items=successful_line_items,
@@ -307,160 +583,68 @@ def safe_run_emissions_engine(activities: list):
         return result
 
 
-def build_result_from_line_items(
-    line_items: list,
-    errors: list,
-    data_quality: dict | None = None,
-    unmapped_categories: list | None = None,
-    factor_transparency: list | None = None
-):
-    df_results = pd.DataFrame(line_items) if line_items else pd.DataFrame()
+# =========================
+# RESULT ENRICHMENT
+# =========================
+def merge_file_errors_with_result(base_result: dict, file_level_errors: list) -> dict:
+    result = dict(base_result)
+    combined_errors = file_level_errors + result.get("errors", [])
+    result["errors"] = combined_errors
 
-    total_kg = 0.0
-    total_t = 0.0
-    summary_by_scope = []
-    summary_by_scope_category = []
+    if "error_summary" not in result or not result.get("error_summary"):
+        result["error_summary"] = build_error_summary(combined_errors)
 
-    if not df_results.empty and "emissions_kgCO2e" in df_results.columns:
-        df_results["emissions_kgCO2e"] = pd.to_numeric(df_results["emissions_kgCO2e"], errors="coerce").fillna(0)
+    if "errors_preview" not in result or not result.get("errors_preview"):
+        result["errors_preview"] = combined_errors[:50]
 
-        total_kg = round(float(df_results["emissions_kgCO2e"].sum()), 4)
-        total_t = round(total_kg / 1000, 4)
+    return result
 
-        if "scope" in df_results.columns:
-            df_scope = (
-                df_results.groupby("scope", as_index=False)["emissions_kgCO2e"]
-                .sum()
-                .sort_values("emissions_kgCO2e", ascending=False)
-            )
-            if not df_scope.empty:
-                df_scope["emissions_tCO2e"] = (df_scope["emissions_kgCO2e"] / 1000).round(4)
-                df_scope["emissions_kgCO2e"] = df_scope["emissions_kgCO2e"].round(4)
-                summary_by_scope = df_scope.to_dict(orient="records")
 
-        if "scope" in df_results.columns and "category" in df_results.columns:
-            df_scope_cat = (
-                df_results.groupby(["scope", "category"], as_index=False)["emissions_kgCO2e"]
-                .sum()
-                .sort_values("emissions_kgCO2e", ascending=False)
-            )
-            if not df_scope_cat.empty:
-                df_scope_cat["emissions_tCO2e"] = (df_scope_cat["emissions_kgCO2e"] / 1000).round(4)
-                df_scope_cat["emissions_kgCO2e"] = df_scope_cat["emissions_kgCO2e"].round(4)
-                summary_by_scope_category = df_scope_cat.to_dict(orient="records")
+def build_api_response(
+    full_result: dict,
+    uploaded_files_info: list,
+    input_row_count: int,
+    user: dict,
+    privacy_consent: bool = True,
+    contact_consent: bool = True
+) -> dict:
+    analytics = full_result.get("analytics") or build_analytics_from_line_items(full_result)
+    errors = full_result.get("errors", [])
+    error_summary = full_result.get("error_summary") or build_error_summary(errors)
+    errors_preview = full_result.get("errors_preview") or errors[:50]
 
     return {
-        "totals": {
-            "total_kgCO2e": total_kg,
-            "total_tCO2e": total_t
-        },
-        "summary_by_scope": summary_by_scope,
-        "summary_by_scope_category": summary_by_scope_category,
-        "line_items": line_items,
+        "totals": full_result.get("totals", {}),
+        "summary_by_scope": full_result.get("summary_by_scope", []),
+        "summary_by_scope_category": full_result.get("summary_by_scope_category", []),
+        "line_items": full_result.get("line_items", []),
+        "uploaded_files": uploaded_files_info,
+        "input_row_count": input_row_count,
+        "privacy_consent": privacy_consent,
+        "contact_consent": contact_consent,
+        "user": user,
+        "analytics": analytics,
+        "top_categories_by_kgco2e": full_result.get("top_categories_by_kgco2e", []),
+        "top_sites_by_kgco2e": full_result.get("top_sites_by_kgco2e", []),
+        "plain_language_takeaways": full_result.get("plain_language_takeaways", []),
+        "actionable_insights": full_result.get("actionable_insights", []),
+        "confidence_score": full_result.get("confidence_score", {}),
+        "methodology_summary": full_result.get("methodology_summary", {}),
+        "factor_quality_summary": full_result.get("factor_quality_summary", []),
+        "error_count": len(errors),
         "errors": errors,
-        "data_quality": data_quality or {},
-        "unmapped_categories": unmapped_categories or [],
-        "factor_transparency": factor_transparency or []
+        "errors_preview": errors_preview,
+        "error_summary": error_summary,
+        "issue_groups": full_result.get("issue_groups", []),
+        "data_quality": full_result.get("data_quality", {}),
+        "unmapped_categories": full_result.get("unmapped_categories", []),
+        "factor_transparency": full_result.get("factor_transparency", []),
     }
 
 
-def build_analytics(result: dict) -> dict:
-    df_results = pd.DataFrame(result.get("line_items", []))
-    analytics = {}
-
-    if df_results.empty:
-        analytics["average_emissions_per_row_kgco2e"] = 0
-        return analytics
-
-    if "emissions_kgCO2e" in df_results.columns:
-        df_results["emissions_kgCO2e"] = pd.to_numeric(df_results["emissions_kgCO2e"], errors="coerce").fillna(0)
-        analytics["average_emissions_per_row_kgco2e"] = round(
-            float(df_results["emissions_kgCO2e"].mean()), 4
-        )
-    else:
-        analytics["average_emissions_per_row_kgco2e"] = 0
-
-    if "category" in df_results.columns:
-        df_cat = (
-            df_results.groupby("category", as_index=False)["emissions_kgCO2e"]
-            .sum()
-            .sort_values("emissions_kgCO2e", ascending=False)
-        )
-        if not df_cat.empty:
-            analytics["top_category_by_kgco2e"] = {
-                "category": df_cat.iloc[0]["category"],
-                "emissions_kgCO2e": round(float(df_cat.iloc[0]["emissions_kgCO2e"]), 4)
-            }
-
-    if "site_name" in df_results.columns and df_results["site_name"].notna().any():
-        df_site = (
-            df_results[df_results["site_name"].astype(str).str.strip() != ""]
-            .groupby("site_name", as_index=False)["emissions_kgCO2e"]
-            .sum()
-            .sort_values("emissions_kgCO2e", ascending=False)
-        )
-        if not df_site.empty:
-            analytics["top_site_by_kgco2e"] = {
-                "site_name": df_site.iloc[0]["site_name"],
-                "emissions_kgCO2e": round(float(df_site.iloc[0]["emissions_kgCO2e"]), 4)
-            }
-
-    if "reporting_period" in df_results.columns and df_results["reporting_period"].notna().any():
-        df_period = (
-            df_results[df_results["reporting_period"].astype(str).str.strip() != ""]
-            .groupby("reporting_period", as_index=False)["emissions_kgCO2e"]
-            .sum()
-            .sort_values("reporting_period")
-        )
-        analytics["period_trend"] = df_period.to_dict(orient="records")
-
-    return analytics
-
-
-def build_error_summary(errors: list) -> list:
-    if not errors:
-        return []
-
-    df_errors = pd.DataFrame(errors)
-    if "error" not in df_errors.columns:
-        return []
-
-    grouped = df_errors["error"].astype(str).value_counts().reset_index()
-    grouped.columns = ["error", "count"]
-
-    return grouped.to_dict(orient="records")
-
-
-def add_bar_chart(ws, title, data_col, category_col, start_row, end_row, anchor):
-    chart = BarChart()
-    chart.title = title
-    chart.y_axis.title = "kg CO2e"
-    chart.x_axis.title = "Category"
-
-    data = Reference(ws, min_col=data_col, min_row=start_row, max_row=end_row)
-    categories = Reference(ws, min_col=category_col, min_row=start_row + 1, max_row=end_row)
-
-    chart.add_data(data, titles_from_data=True)
-    chart.set_categories(categories)
-    chart.height = 8
-    chart.width = 16
-    ws.add_chart(chart, anchor)
-
-
-def add_pie_chart(ws, title, data_col, category_col, start_row, end_row, anchor):
-    chart = PieChart()
-    chart.title = title
-
-    data = Reference(ws, min_col=data_col, min_row=start_row, max_row=end_row)
-    labels = Reference(ws, min_col=category_col, min_row=start_row + 1, max_row=end_row)
-
-    chart.add_data(data, titles_from_data=True)
-    chart.set_categories(labels)
-    chart.height = 8
-    chart.width = 12
-    ws.add_chart(chart, anchor)
-
-
+# =========================
+# LEAD LOGGING
+# =========================
 def send_lead_to_logger(user_data: dict, result: dict, uploaded_files_info: list):
     url = os.getenv("LEAD_LOGGER_URL")
     if not url:
@@ -468,6 +652,7 @@ def send_lead_to_logger(user_data: dict, result: dict, uploaded_files_info: list
 
     totals = result.get("totals", {})
     analytics = result.get("analytics", {})
+    confidence = result.get("confidence_score", {})
 
     payload = {
         "full_name": user_data.get("full_name", ""),
@@ -482,6 +667,7 @@ def send_lead_to_logger(user_data: dict, result: dict, uploaded_files_info: list
         "total_tco2e": totals.get("total_tCO2e", 0),
         "top_category": (analytics.get("top_category_by_kgco2e") or {}).get("category", ""),
         "top_site": (analytics.get("top_site_by_kgco2e") or {}).get("site_name", ""),
+        "confidence_score": confidence.get("score", 0),
         "source": "website_calculator"
     }
 
@@ -489,6 +675,274 @@ def send_lead_to_logger(user_data: dict, result: dict, uploaded_files_info: list
         requests.post(url, json=payload, timeout=5)
     except Exception as e:
         print(f"Lead logger failed: {type(e).__name__}: {str(e)}")
+
+
+# =========================
+# EXCEL BUILDERS
+# =========================
+def write_df(writer, sheet_name: str, df: pd.DataFrame):
+    sheet_name = sanitize_sheet_name(sheet_name)
+    if df is None or df.empty:
+        pd.DataFrame([{"message": "No data available"}]).to_excel(
+            writer, sheet_name=sheet_name, index=False, startrow=6
+        )
+    else:
+        df.to_excel(writer, sheet_name=sheet_name, index=False, startrow=6)
+
+
+def build_overview_dataframe(result: dict, uploaded_files_info: list):
+    totals = result.get("totals", {})
+    confidence = result.get("confidence_score", {})
+    dq = result.get("data_quality", {})
+
+    return pd.DataFrame([{
+        "total_kgCO2e": totals.get("total_kgCO2e", 0),
+        "total_tCO2e": totals.get("total_tCO2e", 0),
+        "input_row_count": result.get("input_row_count", 0),
+        "uploaded_files_count": len(uploaded_files_info),
+        "error_count": result.get("error_count", 0),
+        "confidence_score": confidence.get("score", 0),
+        "confidence_label": confidence.get("label", ""),
+        "coverage_percent": dq.get("coverage_percent", 0),
+        "valid_rows_percent": dq.get("valid_rows_percent", 0),
+        "invalid_rows_percent": dq.get("invalid_rows_percent", 0),
+        "privacy_consent": result.get("privacy_consent", False),
+        "contact_consent": result.get("contact_consent", False),
+    }])
+
+
+def build_executive_summary_dataframe(result: dict):
+    totals = result.get("totals", {})
+    analytics = result.get("analytics", {})
+    confidence = result.get("confidence_score", {})
+    dq = result.get("data_quality", {})
+    top_category = analytics.get("top_category_by_kgco2e", {})
+    top_site = analytics.get("top_site_by_kgco2e", {})
+    top_scope = (result.get("summary_by_scope") or [{}])[0]
+
+    return pd.DataFrame([{
+        "total_tCO2e": totals.get("total_tCO2e", 0),
+        "total_kgCO2e": totals.get("total_kgCO2e", 0),
+        "largest_scope": top_scope.get("scope", ""),
+        "largest_scope_percent": top_scope.get("percent_of_total", 0),
+        "top_category": top_category.get("category", ""),
+        "top_category_kgCO2e": top_category.get("emissions_kgCO2e", 0),
+        "top_site": top_site.get("site_name", ""),
+        "top_site_kgCO2e": top_site.get("emissions_kgCO2e", 0),
+        "confidence_score": confidence.get("score", 0),
+        "confidence_label": confidence.get("label", ""),
+        "coverage_percent": dq.get("coverage_percent", 0),
+    }])
+
+
+def write_summary_sheet(writer, result: dict):
+    workbook = writer.book
+    ws = workbook.create_sheet("Executive Summary")
+
+    style_report_sheet(
+        ws,
+        title="GS Carbon Emissions Report",
+        subtitle="Executive summary for uploaded datasets"
+    )
+
+    totals = result.get("totals", {})
+    confidence = result.get("confidence_score", {})
+    dq = result.get("data_quality", {})
+    takeaways = result.get("plain_language_takeaways", [])
+    insights = result.get("actionable_insights", [])
+    issue_groups = result.get("issue_groups", [])
+    scope_rows = result.get("summary_by_scope", [])
+    top_categories = result.get("top_categories_by_kgco2e", [])
+
+    ws["A6"] = "Metric"
+    ws["B6"] = "Value"
+    ws["A7"] = "Total emissions (tCO2e)"
+    ws["B7"] = totals.get("total_tCO2e", 0)
+    ws["A8"] = "Total emissions (kgCO2e)"
+    ws["B8"] = totals.get("total_kgCO2e", 0)
+    ws["A9"] = "Confidence score"
+    ws["B9"] = confidence.get("score", 0)
+    ws["A10"] = "Confidence label"
+    ws["B10"] = confidence.get("label", "")
+    ws["A11"] = "Coverage percent"
+    ws["B11"] = dq.get("coverage_percent", 0)
+    ws["A12"] = "Error count"
+    ws["B12"] = result.get("error_count", 0)
+
+    ws["D6"] = "Plain-language takeaways"
+    takeaways_row = 7
+    if takeaways:
+        for item in takeaways:
+            ws[f"D{takeaways_row}"] = item
+            takeaways_row += 1
+    else:
+        ws["D7"] = "No takeaways available."
+
+    ws["G6"] = "Actionable insights"
+    insights_row = 7
+    if insights:
+        for item in insights:
+            ws[f"G{insights_row}"] = item.get("title", "")
+            ws[f"H{insights_row}"] = item.get("body", "")
+            insights_row += 1
+    else:
+        ws["G7"] = "No insights available."
+
+    ws["A15"] = "Scope"
+    ws["B15"] = "kg CO2e"
+    ws["C15"] = "% of total"
+    for i, row in enumerate(scope_rows, start=16):
+        ws[f"A{i}"] = row.get("scope")
+        ws[f"B{i}"] = row.get("emissions_kgCO2e")
+        ws[f"C{i}"] = row.get("percent_of_total")
+
+    ws["E15"] = "Top category"
+    ws["F15"] = "kg CO2e"
+    for i, row in enumerate(top_categories, start=16):
+        ws[f"E{i}"] = row.get("category")
+        ws[f"F{i}"] = row.get("emissions_kgCO2e")
+
+    ws["G15"] = "Issue group"
+    ws["H15"] = "Severity"
+    ws["I15"] = "Count"
+    ws["J15"] = "Guidance"
+    for i, row in enumerate(issue_groups, start=16):
+        ws[f"G{i}"] = row.get("title")
+        ws[f"H{i}"] = row.get("severity")
+        ws[f"I{i}"] = row.get("count")
+        ws[f"J{i}"] = row.get("guidance")
+
+    auto_fit_columns(ws)
+
+
+def write_charts_sheet(writer, result: dict):
+    workbook = writer.book
+    ws = workbook.create_sheet("Charts")
+
+    style_report_sheet(
+        ws,
+        title="GS Carbon Emissions Report",
+        subtitle="Visual summary of uploaded datasets"
+    )
+
+    scope_rows = result.get("summary_by_scope", [])
+    cat_rows = result.get("summary_by_scope_category", [])
+
+    ws["A6"] = "Scope"
+    ws["B6"] = "kg CO2e"
+    for i, row in enumerate(scope_rows, start=7):
+        ws[f"A{i}"] = row.get("scope")
+        ws[f"B{i}"] = row.get("emissions_kgCO2e")
+
+    ws["D6"] = "Scope - Category"
+    ws["E6"] = "kg CO2e"
+    for i, row in enumerate(cat_rows, start=7):
+        ws[f"D{i}"] = f"{row.get('scope')} - {row.get('category')}"
+        ws[f"E{i}"] = row.get("emissions_kgCO2e")
+
+    ws["J6"] = "Scope"
+    ws["K6"] = "kg CO2e"
+    for i, row in enumerate(scope_rows, start=7):
+        ws[f"J{i}"] = row.get("scope")
+        ws[f"K{i}"] = row.get("emissions_kgCO2e")
+
+    ws["N6"] = "Scope - Category"
+    ws["O6"] = "kg CO2e"
+    for i, row in enumerate(cat_rows, start=7):
+        ws[f"N{i}"] = f"{row.get('scope')} - {row.get('category')}"
+        ws[f"O{i}"] = row.get("emissions_kgCO2e")
+
+    if len(scope_rows) > 0:
+        add_bar_chart(ws, "Emissions by Scope", 2, 1, 6, 6 + len(scope_rows), "G6")
+        add_pie_chart(ws, "Scope Share", 11, 10, 6, 6 + len(scope_rows), "Q6")
+
+    if len(cat_rows) > 0:
+        add_bar_chart(ws, "Emissions by Scope and Category", 5, 4, 6, 6 + len(cat_rows), "G24")
+        add_pie_chart(ws, "Category Share", 15, 14, 6, 6 + len(cat_rows), "Q24")
+
+    auto_fit_columns(ws)
+
+
+def build_excel_report(result: dict, uploaded_files_info: list) -> io.BytesIO:
+    output = io.BytesIO()
+
+    df_overview = build_overview_dataframe(result, uploaded_files_info)
+    df_exec = build_executive_summary_dataframe(result)
+    df_summary_scope = pd.DataFrame(result.get("summary_by_scope", []))
+    df_summary_scope_cat = pd.DataFrame(result.get("summary_by_scope_category", []))
+    df_results = pd.DataFrame(result.get("line_items", []))
+    df_errors = pd.DataFrame(result.get("errors", []))
+    df_error_summary = pd.DataFrame(result.get("error_summary", []))
+    df_issue_groups = pd.DataFrame(result.get("issue_groups", []))
+    df_uploaded_files = pd.DataFrame(uploaded_files_info)
+    df_analytics = pd.DataFrame([{"metric": k, "value": str(v)} for k, v in (result.get("analytics", {}) or {}).items()])
+    df_user = pd.DataFrame([result.get("user", {})])
+    df_data_quality = pd.DataFrame([result.get("data_quality", {})]) if result.get("data_quality") else pd.DataFrame()
+    df_unmapped_categories = pd.DataFrame(result.get("unmapped_categories", []))
+    df_factor_transparency = pd.DataFrame(result.get("factor_transparency", []))
+    df_factor_quality = pd.DataFrame(result.get("factor_quality_summary", []))
+    df_confidence = pd.DataFrame([result.get("confidence_score", {})]) if result.get("confidence_score") else pd.DataFrame()
+    df_methodology = pd.DataFrame([result.get("methodology_summary", {})]) if result.get("methodology_summary") else pd.DataFrame()
+    df_takeaways = pd.DataFrame([{"takeaway": x} for x in result.get("plain_language_takeaways", [])])
+    df_insights = pd.DataFrame(result.get("actionable_insights", []))
+    df_top_categories = pd.DataFrame(result.get("top_categories_by_kgco2e", []))
+    df_top_sites = pd.DataFrame(result.get("top_sites_by_kgco2e", []))
+
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        write_df(writer, "Overview", df_overview)
+        write_df(writer, "Executive Summary Data", df_exec)
+        write_df(writer, "Summary by Scope", df_summary_scope)
+        write_df(writer, "Summary by Category", df_summary_scope_cat)
+        write_df(writer, "Top Categories", df_top_categories)
+        write_df(writer, "Top Sites", df_top_sites)
+        write_df(writer, "Takeaways", df_takeaways)
+        write_df(writer, "Insights", df_insights)
+        write_df(writer, "Confidence", df_confidence)
+        write_df(writer, "Data Quality", df_data_quality)
+        write_df(writer, "Issue Groups", df_issue_groups)
+        write_df(writer, "Errors", df_errors)
+        write_df(writer, "Error Summary", df_error_summary)
+        write_df(writer, "Uploaded Files", df_uploaded_files)
+        write_df(writer, "Results", df_results)
+        write_df(writer, "Analytics", df_analytics)
+        write_df(writer, "Methodology", df_methodology)
+        write_df(writer, "User Details", df_user)
+        write_df(writer, "Unmapped Categories", df_unmapped_categories)
+        write_df(writer, "Factor Transparency", df_factor_transparency)
+        write_df(writer, "Factor Quality", df_factor_quality)
+
+        workbook = writer.book
+
+        for sheet_name in workbook.sheetnames:
+            ws = workbook[sheet_name]
+            style_report_sheet(ws)
+            auto_fit_columns(ws)
+
+        write_summary_sheet(writer, result)
+        write_charts_sheet(writer, result)
+
+    output.seek(0)
+    return output
+
+
+# =========================
+# API ROUTES
+# =========================
+@app.post("/calculate")
+def calculate(payload: dict):
+    try:
+        activities = payload.get("activities", [])
+
+        if not isinstance(activities, list):
+            raise HTTPException(status_code=400, detail="activities must be a list")
+
+        result = run_emissions_engine({"activities": activities})
+        return result
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {str(e)}")
 
 
 @app.post("/upload-calculate")
@@ -499,62 +953,35 @@ async def upload_calculate(
     full_name: Annotated[str, Form(...)],
     email: Annotated[str, Form(...)],
     company_name: Annotated[str, Form(...)],
-    phone_number: Annotated[str, Form(...)]
+    phone_number: Annotated[str, Form(...)],
 ):
     try:
-        if str(privacy_consent).lower() != "true":
-            raise HTTPException(status_code=400, detail="Privacy consent is required.")
+        validate_user_inputs(
+            privacy_consent=privacy_consent,
+            contact_consent=contact_consent,
+            full_name=full_name,
+            email=email,
+            company_name=company_name,
+            phone_number=phone_number,
+        )
 
-        if str(contact_consent).lower() != "true":
-            raise HTTPException(status_code=400, detail="Contact consent is required.")
-
-        if not safe_string(full_name):
-            raise HTTPException(status_code=400, detail="Full name is required.")
-
-        if not safe_string(email):
-            raise HTTPException(status_code=400, detail="Email is required.")
-
-        if not safe_string(company_name):
-            raise HTTPException(status_code=400, detail="Company name is required.")
-
-        if not safe_string(phone_number):
-            raise HTTPException(status_code=400, detail="Phone number is required.")
+        user = build_user_object(full_name, email, company_name, phone_number)
 
         combined_df_clean, uploaded_files_info, file_level_errors = prepare_combined_dataframe(files)
-
         activities = combined_df_clean.to_dict(orient="records")
+
         full_result = safe_run_emissions_engine(activities)
+        full_result = merge_file_errors_with_result(full_result, file_level_errors)
 
-        analytics = build_analytics(full_result)
+        api_result = build_api_response(
+            full_result=full_result,
+            uploaded_files_info=uploaded_files_info,
+            input_row_count=len(combined_df_clean),
+            user=user,
+            privacy_consent=True,
+            contact_consent=True
+        )
 
-        row_errors = full_result.get("errors", [])
-        all_errors = file_level_errors + row_errors
-        error_summary = build_error_summary(all_errors)
-
-        result = {
-            "totals": full_result.get("totals", {}),
-            "summary_by_scope": full_result.get("summary_by_scope", []),
-            "summary_by_scope_category": full_result.get("summary_by_scope_category", []),
-            "uploaded_files": uploaded_files_info,
-            "input_row_count": len(combined_df_clean),
-            "privacy_consent": True,
-            "contact_consent": True,
-            "user": {
-                "full_name": full_name,
-                "email": email,
-                "company_name": company_name,
-                "phone_number": phone_number
-            },
-            "analytics": analytics,
-            "error_count": len(all_errors),
-            "errors_preview": all_errors[:50],
-            "error_summary": error_summary,
-            "data_quality": full_result.get("data_quality", {}),
-            "unmapped_categories": full_result.get("unmapped_categories", []),
-            "factor_transparency": full_result.get("factor_transparency", [])
-        }
-
-        # Lead logging happens only here.
         send_lead_to_logger(
             {
                 "full_name": full_name,
@@ -564,15 +991,11 @@ async def upload_calculate(
                 "privacy_consent": True,
                 "contact_consent": True
             },
-            {
-                "totals": full_result.get("totals", {}),
-                "analytics": analytics,
-                "input_row_count": len(combined_df_clean)
-            },
+            api_result,
             uploaded_files_info
         )
 
-        return result
+        return api_result
 
     except HTTPException:
         raise
@@ -588,188 +1011,36 @@ async def upload_calculate_download(
     full_name: Annotated[str, Form(...)],
     email: Annotated[str, Form(...)],
     company_name: Annotated[str, Form(...)],
-    phone_number: Annotated[str, Form(...)]
+    phone_number: Annotated[str, Form(...)],
 ):
     try:
-        if str(privacy_consent).lower() != "true":
-            raise HTTPException(status_code=400, detail="Privacy consent is required.")
+        validate_user_inputs(
+            privacy_consent=privacy_consent,
+            contact_consent=contact_consent,
+            full_name=full_name,
+            email=email,
+            company_name=company_name,
+            phone_number=phone_number,
+        )
 
-        if str(contact_consent).lower() != "true":
-            raise HTTPException(status_code=400, detail="Contact consent is required.")
-
-        if not safe_string(full_name):
-            raise HTTPException(status_code=400, detail="Full name is required.")
-
-        if not safe_string(email):
-            raise HTTPException(status_code=400, detail="Email is required.")
-
-        if not safe_string(company_name):
-            raise HTTPException(status_code=400, detail="Company name is required.")
-
-        if not safe_string(phone_number):
-            raise HTTPException(status_code=400, detail="Phone number is required.")
+        user = build_user_object(full_name, email, company_name, phone_number)
 
         combined_df_clean, uploaded_files_info, file_level_errors = prepare_combined_dataframe(files)
-
         activities = combined_df_clean.to_dict(orient="records")
-        result = safe_run_emissions_engine(activities)
 
-        result["errors"] = file_level_errors + result.get("errors", [])
-        result["uploaded_files"] = uploaded_files_info
-        result["input_row_count"] = len(combined_df_clean)
-        result["privacy_consent"] = True
-        result["contact_consent"] = True
-        result["user"] = {
-            "full_name": full_name,
-            "email": email,
-            "company_name": company_name,
-            "phone_number": phone_number
-        }
-        result["analytics"] = build_analytics(result)
-        result["data_quality"] = result.get("data_quality", {})
-        result["unmapped_categories"] = result.get("unmapped_categories", [])
-        result["factor_transparency"] = result.get("factor_transparency", [])
+        full_result = safe_run_emissions_engine(activities)
+        full_result = merge_file_errors_with_result(full_result, file_level_errors)
 
-        df_results = pd.DataFrame(result.get("line_items", []))
-        df_errors = pd.DataFrame(result.get("errors", []))
-        df_summary_scope = pd.DataFrame(result.get("summary_by_scope", []))
-        df_summary_scope_cat = pd.DataFrame(result.get("summary_by_scope_category", []))
-        df_uploaded_files = pd.DataFrame(uploaded_files_info)
-        df_analytics = pd.DataFrame(
-            [{"metric": k, "value": str(v)} for k, v in result.get("analytics", {}).items()]
+        api_result = build_api_response(
+            full_result=full_result,
+            uploaded_files_info=uploaded_files_info,
+            input_row_count=len(combined_df_clean),
+            user=user,
+            privacy_consent=True,
+            contact_consent=True
         )
-        df_user = pd.DataFrame([result["user"]])
-        df_error_summary = pd.DataFrame(build_error_summary(result.get("errors", [])))
-        df_data_quality = pd.DataFrame([result.get("data_quality", {})]) if result.get("data_quality") else pd.DataFrame()
-        df_unmapped_categories = pd.DataFrame(result.get("unmapped_categories", []))
-        df_factor_transparency = pd.DataFrame(result.get("factor_transparency", []))
 
-        totals = result.get("totals", {})
-        df_overview = pd.DataFrame([{
-            "total_kgCO2e": totals.get("total_kgCO2e", 0),
-            "total_tCO2e": totals.get("total_tCO2e", 0),
-            "input_row_count": len(combined_df_clean),
-            "uploaded_files_count": len(uploaded_files_info),
-            "privacy_consent": True,
-            "contact_consent": True
-        }])
-
-        output = io.BytesIO()
-
-        with pd.ExcelWriter(output, engine="openpyxl") as writer:
-            df_overview.to_excel(writer, sheet_name="Overview", index=False, startrow=6)
-            df_summary_scope.to_excel(writer, sheet_name="Summary by Scope", index=False, startrow=6)
-            df_summary_scope_cat.to_excel(writer, sheet_name="Summary by Category", index=False, startrow=6)
-            df_results.to_excel(writer, sheet_name="Results", index=False, startrow=6)
-            df_errors.to_excel(writer, sheet_name="Errors", index=False, startrow=6)
-            df_error_summary.to_excel(writer, sheet_name="Error Summary", index=False, startrow=6)
-            df_uploaded_files.to_excel(writer, sheet_name="Uploaded Files", index=False, startrow=6)
-            df_analytics.to_excel(writer, sheet_name="Analytics", index=False, startrow=6)
-            df_user.to_excel(writer, sheet_name="User Details", index=False, startrow=6)
-            df_data_quality.to_excel(writer, sheet_name="Data Quality", index=False, startrow=6)
-            df_unmapped_categories.to_excel(writer, sheet_name="Unmapped Categories", index=False, startrow=6)
-            df_factor_transparency.to_excel(writer, sheet_name="Factor Transparency", index=False, startrow=6)
-
-            workbook = writer.book
-
-            for sheet_name in workbook.sheetnames:
-                ws = workbook[sheet_name]
-                ws["A1"] = "GS Carbon Emissions Report"
-                ws["A2"] = "Generated from uploaded datasets"
-                ws["A3"] = "Aligned with GHG Protocol and DEFRA 2025"
-
-                logo_path = "logo.png"
-                if os.path.exists(logo_path):
-                    try:
-                        logo = XLImage(logo_path)
-                        logo.width = 140
-                        logo.height = 70
-                        ws.add_image(logo, "L1")
-                    except Exception:
-                        pass
-
-            chart_ws = workbook.create_sheet("Charts")
-            chart_ws["A1"] = "GS Carbon Emissions Report"
-            chart_ws["A2"] = "Generated from uploaded datasets"
-            chart_ws["A3"] = "Aligned with GHG Protocol and DEFRA 2025"
-
-            logo_path = "logo.png"
-            if os.path.exists(logo_path):
-                try:
-                    logo = XLImage(logo_path)
-                    logo.width = 140
-                    logo.height = 70
-                    chart_ws.add_image(logo, "L1")
-                except Exception:
-                    pass
-
-            chart_ws["A6"] = "Scope"
-            chart_ws["B6"] = "kg CO2e"
-            for i, row in enumerate(result.get("summary_by_scope", []), start=7):
-                chart_ws[f"A{i}"] = row.get("scope")
-                chart_ws[f"B{i}"] = row.get("emissions_kgCO2e")
-
-            chart_ws["D6"] = "Category"
-            chart_ws["E6"] = "kg CO2e"
-            for i, row in enumerate(result.get("summary_by_scope_category", []), start=7):
-                chart_ws[f"D{i}"] = f"{row.get('scope')} - {row.get('category')}"
-                chart_ws[f"E{i}"] = row.get("emissions_kgCO2e")
-
-            chart_ws["J6"] = "Scope"
-            chart_ws["K6"] = "kg CO2e"
-            for i, row in enumerate(result.get("summary_by_scope", []), start=7):
-                chart_ws[f"J{i}"] = row.get("scope")
-                chart_ws[f"K{i}"] = row.get("emissions_kgCO2e")
-
-            chart_ws["N6"] = "Category"
-            chart_ws["O6"] = "kg CO2e"
-            for i, row in enumerate(result.get("summary_by_scope_category", []), start=7):
-                chart_ws[f"N{i}"] = f"{row.get('scope')} - {row.get('category')}"
-                chart_ws[f"O{i}"] = row.get("emissions_kgCO2e")
-
-            if len(result.get("summary_by_scope", [])) > 0:
-                add_bar_chart(
-                    chart_ws,
-                    "Emissions by Scope",
-                    2,
-                    1,
-                    6,
-                    6 + len(result.get("summary_by_scope", [])),
-                    "G6"
-                )
-
-                add_pie_chart(
-                    chart_ws,
-                    "Scope Share",
-                    11,
-                    10,
-                    6,
-                    6 + len(result.get("summary_by_scope", [])),
-                    "Q6"
-                )
-
-            if len(result.get("summary_by_scope_category", [])) > 0:
-                add_bar_chart(
-                    chart_ws,
-                    "Emissions by Scope and Category",
-                    5,
-                    4,
-                    6,
-                    6 + len(result.get("summary_by_scope_category", [])),
-                    "G24"
-                )
-
-                add_pie_chart(
-                    chart_ws,
-                    "Category Share",
-                    15,
-                    14,
-                    6,
-                    6 + len(result.get("summary_by_scope_category", [])),
-                    "Q24"
-                )
-
-        output.seek(0)
+        output = build_excel_report(api_result, uploaded_files_info)
 
         return StreamingResponse(
             output,
