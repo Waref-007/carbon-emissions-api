@@ -10,7 +10,7 @@ import requests
 import pandas as pd
 from datetime import datetime
 import json
-pip install fastapi pandas openpyxl requests
+
 from openpyxl.drawing.image import Image as XLImage
 from openpyxl.chart import BarChart, PieChart, Reference
 from openpyxl.styles import Font, PatternFill
