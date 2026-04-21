@@ -1,98 +1,189 @@
 import pandas as pd
 import numpy as np
 from typing import Dict, List, Optional, Any, Tuple
-import re
 from enum import Enum
+from datetime import datetime
+import json
+import io
+import re
+from difflib import SequenceMatcher
 
+
+# =========================
+# ENUMS & CONSTANTS
+# =========================
 class DEFRAYear(Enum):
     """Supported DEFRA factor years."""
     DEFRA_2023 = 2023
     DEFRA_2024 = 2024
     DEFRA_2025 = 2025
 
-# =========================
-# FACTOR TABLES
-# =========================
 
-df_fuels_clean = pd.DataFrame([
-    {"Activity": "Gaseous fuels", "Fuel": "Natural gas", "Unit": "kWh (Gross CV)", "kg CO2e": 0.18296},
-    {"Activity": "Gaseous fuels", "Fuel": "Natural gas", "Unit": "kWh (Net CV)", "kg CO2e": 0.20270},
-    {"Activity": "Gaseous fuels", "Fuel": "Natural gas", "Unit": "cubic metres", "kg CO2e": 2.06672},
-    {"Activity": "Gaseous fuels", "Fuel": "Natural gas", "Unit": "tonnes", "kg CO2e": 2575.46441},
-])
-
-df_electricity_clean = pd.DataFrame([
-    {"Activity": "Electricity generated", "Country": "Electricity: UK", "Unit": "kWh", "Year": 2025, "kg CO2e": 0.177}
-])
-
-df_water_clean = pd.DataFrame([
-    {"Activity": "Water supply", "Type": "Water supply", "Unit": "cubic metres", "kg CO2e": 0.1913},
-    {"Activity": "Water supply", "Type": "Water supply", "Unit": "million litres", "kg CO2e": 191.30156},
-])
-
-# DEFRA 2025 VEHICLE FACTORS (Scope 3)
-df_vehicle_emissions = pd.DataFrame([
-    {"Activity": "Business travel", "Vehicle Type": "Petrol car", "Unit": "vehicle_km", "kg CO2e": 0.192, "Scope": "Scope 3", "DEFRA Source": "DEFRA 2025"},
-    {"Activity": "Business travel", "Vehicle Type": "Diesel car", "Unit": "vehicle_km", "kg CO2e": 0.158, "Scope": "Scope 3", "DEFRA Source": "DEFRA 2025"},
-    {"Activity": "Business travel", "Vehicle Type": "Electric car (BEV)", "Unit": "vehicle_km", "kg CO2e": 0.076, "Scope": "Scope 3", "DEFRA Source": "DEFRA 2025"},
-    {"Activity": "Business travel", "Vehicle Type": "Hybrid (HEV/PHEV)", "Unit": "vehicle_km", "kg CO2e": 0.112, "Scope": "Scope 3", "DEFRA Source": "DEFRA 2025"},
-    {"Activity": "Business travel", "Vehicle Type": "HGV (44 tonnes)", "Unit": "vehicle_km", "kg CO2e": 0.975, "Scope": "Scope 3", "DEFRA Source": "DEFRA 2025"},
-    {"Activity": "Business travel", "Vehicle Type": "Light commercial vehicle", "Unit": "vehicle_km", "kg CO2e": 0.238, "Scope": "Scope 3", "DEFRA Source": "DEFRA 2025"},
-    {"Activity": "Business travel", "Vehicle Type": "Bus", "Unit": "passenger_km", "kg CO2e": 0.089, "Scope": "Scope 3", "DEFRA Source": "DEFRA 2025"},
-    {"Activity": "Business travel", "Vehicle Type": "Flight (short-haul)", "Unit": "passenger_km", "kg CO2e": 0.255, "Scope": "Scope 3", "DEFRA Source": "DEFRA 2025"},
-    {"Activity": "Business travel", "Vehicle Type": "Flight (medium-haul)", "Unit": "passenger_km", "kg CO2e": 0.195, "Scope": "Scope 3", "DEFRA Source": "DEFRA 2025"},
-    {"Activity": "Business travel", "Vehicle Type": "Flight (long-haul)", "Unit": "passenger_km", "kg CO2e": 0.156, "Scope": "Scope 3", "DEFRA Source": "DEFRA 2025"},
-    {"Activity": "Business travel", "Vehicle Type": "Rail", "Unit": "passenger_km", "kg CO2e": 0.035, "Scope": "Scope 3", "DEFRA Source": "DEFRA 2025"},
-    {"Activity": "Business travel", "Vehicle Type": "Hotel stay", "Unit": "room_nights", "kg CO2e": 10.40, "Scope": "Scope 3", "DEFRA Source": "DEFRA 2025"},
-])
-
-df_waste_clean = pd.DataFrame([
-    {"Activity": "Waste generated", "Waste Type": "General waste", "Unit": "tonnes", "kg CO2e": 250.0, "Scope": "Scope 3"},
-    {"Activity": "Waste generated", "Waste Type": "Landfill waste", "Unit": "tonnes", "kg CO2e": 458.0, "Scope": "Scope 3"},
-    {"Activity": "Waste generated", "Waste Type": "Recycling", "Unit": "tonnes", "kg CO2e": 21.0, "Scope": "Scope 3"},
-    {"Activity": "Waste generated", "Waste Type": "Incineration", "Unit": "tonnes", "kg CO2e": 27.0, "Scope": "Scope 3"},
-    {"Activity": "Waste generated", "Waste Type": "General waste", "Unit": "kg", "kg CO2e": 0.250, "Scope": "Scope 3"},
-    {"Activity": "Waste generated", "Waste Type": "Landfill waste", "Unit": "kg", "kg CO2e": 0.458, "Scope": "Scope 3"},
-    {"Activity": "Waste generated", "Waste Type": "Recycling", "Unit": "kg", "kg CO2e": 0.021, "Scope": "Scope 3"},
-    {"Activity": "Waste generated", "Waste Type": "Incineration", "Unit": "kg", "kg CO2e": 0.027, "Scope": "Scope 3"},
-])
+class ColumnIntent(Enum):
+    """Detected intent of a CSV column."""
+    AMOUNT = "amount"
+    UNIT = "unit"
+    CATEGORY = "category"
+    VEHICLE_TYPE = "vehicle_type"
+    DATE_PERIOD = "date_period"
+    DESCRIPTION = "description"
+    UNKNOWN = "unknown"
 
 
 # =========================
-# COLUMN MAPPING & AUTO-DETECTION
+# DEFRA 2025 FACTORS
 # =========================
+DEFRA_2025_ELECTRICITY = pd.DataFrame([
+    {"Country": "Electricity: UK", "Unit": "kWh", "Year": 2025, "kg CO2e": 0.177, "Source": "DEFRA 2025"},
+])
+
+DEFRA_2025_FUELS = pd.DataFrame([
+    {"Activity": "Gaseous fuels", "Fuel": "Natural gas", "Unit": "kWh (Gross CV)", "kg CO2e": 0.18296, "Year": 2025, "Source": "DEFRA 2025"},
+    {"Activity": "Gaseous fuels", "Fuel": "Natural gas", "Unit": "kWh (Net CV)", "kg CO2e": 0.20270, "Year": 2025, "Source": "DEFRA 2025"},
+    {"Activity": "Gaseous fuels", "Fuel": "Natural gas", "Unit": "cubic metres", "kg CO2e": 2.06672, "Year": 2025, "Source": "DEFRA 2025"},
+    {"Activity": "Gaseous fuels", "Fuel": "Natural gas", "Unit": "tonnes", "kg CO2e": 2575.46441, "Year": 2025, "Source": "DEFRA 2025"},
+])
+
+DEFRA_2025_VEHICLES = pd.DataFrame([
+    {"Vehicle Type": "Petrol car", "Unit": "vehicle_km", "kg CO2e": 0.192, "Year": 2025, "Source": "DEFRA 2025"},
+    {"Vehicle Type": "Diesel car", "Unit": "vehicle_km", "kg CO2e": 0.158, "Year": 2025, "Source": "DEFRA 2025"},
+    {"Vehicle Type": "Electric car (BEV)", "Unit": "vehicle_km", "kg CO2e": 0.076, "Year": 2025, "Source": "DEFRA 2025"},
+    {"Vehicle Type": "Hybrid (HEV/PHEV)", "Unit": "vehicle_km", "kg CO2e": 0.112, "Year": 2025, "Source": "DEFRA 2025"},
+    {"Vehicle Type": "HGV (44 tonnes)", "Unit": "vehicle_km", "kg CO2e": 0.975, "Year": 2025, "Source": "DEFRA 2025"},
+    {"Vehicle Type": "Light commercial vehicle", "Unit": "vehicle_km", "kg CO2e": 0.238, "Year": 2025, "Source": "DEFRA 2025"},
+    {"Vehicle Type": "Bus", "Unit": "passenger_km", "kg CO2e": 0.089, "Year": 2025, "Source": "DEFRA 2025"},
+    {"Vehicle Type": "Flight (short-haul)", "Unit": "passenger_km", "kg CO2e": 0.255, "Year": 2025, "Source": "DEFRA 2025"},
+    {"Vehicle Type": "Flight (medium-haul)", "Unit": "passenger_km", "kg CO2e": 0.195, "Year": 2025, "Source": "DEFRA 2025"},
+    {"Vehicle Type": "Flight (long-haul)", "Unit": "passenger_km", "kg CO2e": 0.156, "Year": 2025, "Source": "DEFRA 2025"},
+    {"Vehicle Type": "Rail", "Unit": "passenger_km", "kg CO2e": 0.035, "Year": 2025, "Source": "DEFRA 2025"},
+    {"Vehicle Type": "Hotel stay", "Unit": "room_nights", "kg CO2e": 10.40, "Year": 2025, "Source": "DEFRA 2025"},
+])
+
+DEFRA_2025_WATER = pd.DataFrame([
+    {"Type": "Water supply", "Unit": "cubic metres", "kg CO2e": 0.1913, "Year": 2025, "Source": "DEFRA 2025"},
+    {"Type": "Water supply", "Unit": "million litres", "kg CO2e": 191.30156, "Year": 2025, "Source": "DEFRA 2025"},
+])
+
+DEFRA_2025_WASTE = pd.DataFrame([
+    {"Waste Type": "General waste", "Unit": "tonnes", "kg CO2e": 250.0, "Year": 2025, "Source": "DEFRA 2025"},
+    {"Waste Type": "Landfill waste", "Unit": "tonnes", "kg CO2e": 458.0, "Year": 2025, "Source": "DEFRA 2025"},
+    {"Waste Type": "Recycling", "Unit": "tonnes", "kg CO2e": 21.0, "Year": 2025, "Source": "DEFRA 2025"},
+    {"Waste Type": "Incineration", "Unit": "tonnes", "kg CO2e": 27.0, "Year": 2025, "Source": "DEFRA 2025"},
+    {"Waste Type": "General waste", "Unit": "kg", "kg CO2e": 0.250, "Year": 2025, "Source": "DEFRA 2025"},
+    {"Waste Type": "Landfill waste", "Unit": "kg", "kg CO2e": 0.458, "Year": 2025, "Source": "DEFRA 2025"},
+    {"Waste Type": "Recycling", "Unit": "kg", "kg CO2e": 0.021, "Year": 2025, "Source": "DEFRA 2025"},
+    {"Waste Type": "Incineration", "Unit": "kg", "kg CO2e": 0.027, "Year": 2025, "Source": "DEFRA 2025"},
+])
+
+DEFRA_2024_ELECTRICITY = pd.DataFrame([
+    {"Country": "Electricity: UK", "Unit": "kWh", "Year": 2024, "kg CO2e": 0.185, "Source": "DEFRA 2024"},
+])
+
+DEFRA_2024_FUELS = pd.DataFrame([
+    {"Activity": "Gaseous fuels", "Fuel": "Natural gas", "Unit": "kWh (Gross CV)", "kg CO2e": 0.18500, "Year": 2024, "Source": "DEFRA 2024"},
+    {"Activity": "Gaseous fuels", "Fuel": "Natural gas", "Unit": "kWh (Net CV)", "kg CO2e": 0.20600, "Year": 2024, "Source": "DEFRA 2024"},
+    {"Activity": "Gaseous fuels", "Fuel": "Natural gas", "Unit": "cubic metres", "kg CO2e": 2.09500, "Year": 2024, "Source": "DEFRA 2024"},
+    {"Activity": "Gaseous fuels", "Fuel": "Natural gas", "Unit": "tonnes", "kg CO2e": 2620.50000, "Year": 2024, "Source": "DEFRA 2024"},
+])
+
+DEFRA_2024_VEHICLES = pd.DataFrame([
+    {"Vehicle Type": "Petrol car", "Unit": "vehicle_km", "kg CO2e": 0.198, "Year": 2024, "Source": "DEFRA 2024"},
+    {"Vehicle Type": "Diesel car", "Unit": "vehicle_km", "kg CO2e": 0.162, "Year": 2024, "Source": "DEFRA 2024"},
+    {"Vehicle Type": "Electric car (BEV)", "Unit": "vehicle_km", "kg CO2e": 0.078, "Year": 2024, "Source": "DEFRA 2024"},
+    {"Vehicle Type": "Hybrid (HEV/PHEV)", "Unit": "vehicle_km", "kg CO2e": 0.115, "Year": 2024, "Source": "DEFRA 2024"},
+    {"Vehicle Type": "HGV (44 tonnes)", "Unit": "vehicle_km", "kg CO2e": 0.985, "Year": 2024, "Source": "DEFRA 2024"},
+    {"Vehicle Type": "Light commercial vehicle", "Unit": "vehicle_km", "kg CO2e": 0.242, "Year": 2024, "Source": "DEFRA 2024"},
+    {"Vehicle Type": "Bus", "Unit": "passenger_km", "kg CO2e": 0.092, "Year": 2024, "Source": "DEFRA 2024"},
+    {"Vehicle Type": "Flight (short-haul)", "Unit": "passenger_km", "kg CO2e": 0.261, "Year": 2024, "Source": "DEFRA 2024"},
+    {"Vehicle Type": "Flight (medium-haul)", "Unit": "passenger_km", "kg CO2e": 0.200, "Year": 2024, "Source": "DEFRA 2024"},
+    {"Vehicle Type": "Flight (long-haul)", "Unit": "passenger_km", "kg CO2e": 0.160, "Year": 2024, "Source": "DEFRA 2024"},
+    {"Vehicle Type": "Rail", "Unit": "passenger_km", "kg CO2e": 0.036, "Year": 2024, "Source": "DEFRA 2024"},
+    {"Vehicle Type": "Hotel stay", "Unit": "room_nights", "kg CO2e": 10.62, "Year": 2024, "Source": "DEFRA 2024"},
+])
+
+DEFRA_2024_WATER = pd.DataFrame([
+    {"Type": "Water supply", "Unit": "cubic metres", "kg CO2e": 0.1950, "Year": 2024, "Source": "DEFRA 2024"},
+    {"Type": "Water supply", "Unit": "million litres", "kg CO2e": 195.00000, "Year": 2024, "Source": "DEFRA 2024"},
+])
+
+DEFRA_2024_WASTE = pd.DataFrame([
+    {"Waste Type": "General waste", "Unit": "tonnes", "kg CO2e": 258.0, "Year": 2024, "Source": "DEFRA 2024"},
+    {"Waste Type": "Landfill waste", "Unit": "tonnes", "kg CO2e": 470.0, "Year": 2024, "Source": "DEFRA 2024"},
+    {"Waste Type": "Recycling", "Unit": "tonnes", "kg CO2e": 22.0, "Year": 2024, "Source": "DEFRA 2024"},
+    {"Waste Type": "Incineration", "Unit": "tonnes", "kg CO2e": 28.0, "Year": 2024, "Source": "DEFRA 2024"},
+    {"Waste Type": "General waste", "Unit": "kg", "kg CO2e": 0.258, "Year": 2024, "Source": "DEFRA 2024"},
+    {"Waste Type": "Landfill waste", "Unit": "kg", "kg CO2e": 0.470, "Year": 2024, "Source": "DEFRA 2024"},
+    {"Waste Type": "Recycling", "Unit": "kg", "kg CO2e": 0.022, "Year": 2024, "Source": "DEFRA 2024"},
+    {"Waste Type": "Incineration", "Unit": "kg", "kg CO2e": 0.028, "Year": 2024, "Source": "DEFRA 2024"},
+])
+
+DEFRA_2023_ELECTRICITY = pd.DataFrame([
+    {"Country": "Electricity: UK", "Unit": "kWh", "Year": 2023, "kg CO2e": 0.194, "Source": "DEFRA 2023"},
+])
+
+DEFRA_2023_FUELS = pd.DataFrame([
+    {"Activity": "Gaseous fuels", "Fuel": "Natural gas", "Unit": "kWh (Gross CV)", "kg CO2e": 0.18800, "Year": 2023, "Source": "DEFRA 2023"},
+    {"Activity": "Gaseous fuels", "Fuel": "Natural gas", "Unit": "kWh (Net CV)", "kg CO2e": 0.20900, "Year": 2023, "Source": "DEFRA 2023"},
+    {"Activity": "Gaseous fuels", "Fuel": "Natural gas", "Unit": "cubic metres", "kg CO2e": 2.12500, "Year": 2023, "Source": "DEFRA 2023"},
+    {"Activity": "Gaseous fuels", "Fuel": "Natural gas", "Unit": "tonnes", "kg CO2e": 2661.00000, "Year": 2023, "Source": "DEFRA 2023"},
+])
+
+DEFRA_2023_VEHICLES = pd.DataFrame([
+    {"Vehicle Type": "Petrol car", "Unit": "vehicle_km", "kg CO2e": 0.204, "Year": 2023, "Source": "DEFRA 2023"},
+    {"Vehicle Type": "Diesel car", "Unit": "vehicle_km", "kg CO2e": 0.167, "Year": 2023, "Source": "DEFRA 2023"},
+    {"Vehicle Type": "Electric car (BEV)", "Unit": "vehicle_km", "kg CO2e": 0.081, "Year": 2023, "Source": "DEFRA 2023"},
+    {"Vehicle Type": "Hybrid (HEV/PHEV)", "Unit": "vehicle_km", "kg CO2e": 0.120, "Year": 2023, "Source": "DEFRA 2023"},
+    {"Vehicle Type": "HGV (44 tonnes)", "Unit": "vehicle_km", "kg CO2e": 1.015, "Year": 2023, "Source": "DEFRA 2023"},
+    {"Vehicle Type": "Light commercial vehicle", "Unit": "vehicle_km", "kg CO2e": 0.249, "Year": 2023, "Source": "DEFRA 2023"},
+    {"Vehicle Type": "Bus", "Unit": "passenger_km", "kg CO2e": 0.095, "Year": 2023, "Source": "DEFRA 2023"},
+    {"Vehicle Type": "Flight (short-haul)", "Unit": "passenger_km", "kg CO2e": 0.268, "Year": 2023, "Source": "DEFRA 2023"},
+    {"Vehicle Type": "Flight (medium-haul)", "Unit": "passenger_km", "kg CO2e": 0.206, "Year": 2023, "Source": "DEFRA 2023"},
+    {"Vehicle Type": "Flight (long-haul)", "Unit": "passenger_km", "kg CO2e": 0.165, "Year": 2023, "Source": "DEFRA 2023"},
+    {"Vehicle Type": "Rail", "Unit": "passenger_km", "kg CO2e": 0.037, "Year": 2023, "Source": "DEFRA 2023"},
+    {"Vehicle Type": "Hotel stay", "Unit": "room_nights", "kg CO2e": 10.95, "Year": 2023, "Source": "DEFRA 2023"},
+])
+
+DEFRA_2023_WATER = pd.DataFrame([
+    {"Type": "Water supply", "Unit": "cubic metres", "kg CO2e": 0.2010, "Year": 2023, "Source": "DEFRA 2023"},
+    {"Type": "Water supply", "Unit": "million litres", "kg CO2e": 201.00000, "Year": 2023, "Source": "DEFRA 2023"},
+])
+
+DEFRA_2023_WASTE = pd.DataFrame([
+    {"Waste Type": "General waste", "Unit": "tonnes", "kg CO2e": 268.0, "Year": 2023, "Source": "DEFRA 2023"},
+    {"Waste Type": "Landfill waste", "Unit": "tonnes", "kg CO2e": 485.0, "Year": 2023, "Source": "DEFRA 2023"},
+    {"Waste Type": "Recycling", "Unit": "tonnes", "kg CO2e": 23.0, "Year": 2023, "Source": "DEFRA 2023"},
+    {"Waste Type": "Incineration", "Unit": "tonnes", "kg CO2e": 29.0, "Year": 2023, "Source": "DEFRA 2023"},
+    {"Waste Type": "General waste", "Unit": "kg", "kg CO2e": 0.268, "Year": 2023, "Source": "DEFRA 2023"},
+    {"Waste Type": "Landfill waste", "Unit": "kg", "kg CO2e": 0.485, "Year": 2023, "Source": "DEFRA 2023"},
+    {"Waste Type": "Recycling", "Unit": "kg", "kg CO2e": 0.023, "Year": 2023, "Source": "DEFRA 2023"},
+    {"Waste Type": "Incineration", "Unit": "kg", "kg CO2e": 0.029, "Year": 2023, "Source": "DEFRA 2023"},
+])
+
+
+# =========================
+# ADVANCED ALIAS SYSTEM
+# =========================
+AMOUNT_KEYWORDS = ["energy", "consumption", "usage", "kwh", "electricity", "power", "amount", "volume", "quantity", "total", "spent", "used", "kw h", "gas"]
+UNIT_KEYWORDS = ["unit", "measurement unit", "uom", "unit of measurement", "measure"]
+CATEGORY_KEYWORDS = ["type", "activity type", "category", "activity", "source", "emission type"]
+DATE_KEYWORDS = ["month", "period", "date", "reporting period", "year", "time"]
+VEHICLE_KEYWORDS = ["vehicle", "vehicle type", "transport", "fleet", "car", "truck", "van", "bus", "aircraft"]
+
 COLUMN_ALIASES = {
-    # Energy column variations
+    # Amount
     "energy": "amount",
     "consumption": "amount",
     "usage": "amount",
     "kwh": "amount",
     "electricity": "amount",
     "power": "amount",
-    "kwh consumed": "amount",
-    "total energy": "amount",
-    "monthly consumption": "amount",
-    "yearly consumption": "amount",
-    "annual consumption": "amount",
-    
-    # Unit column variations
     "unit of measurement": "unit",
     "measurement unit": "unit",
     "uom": "unit",
-    
-    # Category column variations
     "type": "category",
     "activity type": "category",
-    "emission source": "category",
-    "scope": "category",
-    
-    # Date/Period
     "month": "reporting_period",
     "period": "reporting_period",
-    "date": "reporting_period",
-    "reporting date": "reporting_period",
-    "year": "reporting_period",
-    "reporting month": "reporting_period",
 }
 
 FUEL_ALIASES = {
@@ -104,94 +195,47 @@ FUEL_ALIASES = {
 UNIT_ALIASES = {
     "kwh (gross cv)": "kWh (Gross CV)",
     "gross cv": "kWh (Gross CV)",
-    "gross": "kWh (Gross CV)",
-    "kwh gross": "kWh (Gross CV)",
-    "kwh ": "kWh (Gross CV)",
-    " kwh ": "kWh (Gross CV)",
-    "kwh gross cv": "kWh (Gross CV)",
     "kwh": "kWh",
     "kwhh": "kWh",
     "kw h": "kWh",
-
     "kwh (net cv)": "kWh (Net CV)",
     "net cv": "kWh (Net CV)",
-    "net": "kWh (Net CV)",
-
     "litre": "litres",
     "litres": "litres",
     "l": "litres",
-
     "cubic metre": "cubic metres",
     "cubic metres": "cubic metres",
     "m3": "cubic metres",
-    "m^3": "cubic metres",
-
     "tonne": "tonnes",
     "tonnes": "tonnes",
     "t": "tonnes",
-
     "room night": "room_nights",
     "room nights": "room_nights",
-    "night": "room_nights",
-    "nights": "room_nights",
-
     "gbp": "gbp",
     "£": "gbp",
-    "spend": "gbp",
-    "currency": "gbp",
-
     "km": "vehicle_km",
     "vehicle km": "vehicle_km",
-    "vehicle_km": "vehicle_km",
-    "miles": "vehicle_km",
-
     "passenger km": "passenger_km",
-    "passenger_km": "passenger_km",
     "pkm": "passenger_km",
-
     "kg": "kg",
 }
 
 CATEGORY_ALIASES = {
     "fuel": "fuel",
     "gas": "fuel",
-    "natural gas": "fuel",
-
     "electricity": "electricity",
     "power": "electricity",
-    "electric": "electricity",
-    "elec": "electricity",
-
     "water": "water",
-    "water supply": "water",
-    "h2o": "water",
-
     "travel": "business travel",
     "business travel": "business travel",
-    "hotel": "business travel",
-    "accommodation": "business travel",
     "flight": "business travel",
-    "air travel": "business travel",
     "rail": "business travel",
-    "train": "business travel",
-    "taxi": "business travel",
-    "car travel": "business travel",
-    "vehicle": "business travel",
-    "transport": "business travel",
-
     "waste": "waste",
-    "general waste": "waste",
-    "landfill": "waste",
-    "recycling": "waste",
-    "incineration": "waste",
 }
 
 VEHICLE_TYPE_ALIASES = {
     "petrol": "Petrol car",
-    "petrol car": "Petrol car",
-    "gasoline": "Petrol car",
     "diesel": "Diesel car",
-    "diesel car": "Diesel car",
     "electric": "Electric car (BEV)",
     "ev": "Electric car (BEV)",
     "bev": "Electric car (BEV)",
@@ -200,193 +244,416 @@ VEHICLE_TYPE_ALIASES = {
     "tesla": "Electric car (BEV)",
     "hybrid": "Hybrid (HEV/PHEV)",
     "phev": "Hybrid (HEV/PHEV)",
-    "hev": "Hybrid (HEV/PHEV)",
-    "plug-in hybrid": "Hybrid (HEV/PHEV)",
     "bmw 330e": "Hybrid (HEV/PHEV)",
     "hgv": "HGV (44 tonnes)",
     "44 tonne": "HGV (44 tonnes)",
-    "44-ton": "HGV (44 tonnes)",
-    "44 ton": "HGV (44 tonnes)",
     "mercedes actros": "HGV (44 tonnes)",
     "truck": "HGV (44 tonnes)",
-    "lorry": "HGV (44 tonnes)",
     "van": "Light commercial vehicle",
     "lcv": "Light commercial vehicle",
-    "light commercial": "Light commercial vehicle",
     "bus": "Bus",
     "flight": "Flight (medium-haul)",
-    "air": "Flight (medium-haul)",
-    "plane": "Flight (medium-haul)",
-    "short-haul flight": "Flight (short-haul)",
-    "long-haul flight": "Flight (long-haul)",
+    "short-haul": "Flight (short-haul)",
+    "long-haul": "Flight (long-haul)",
     "rail": "Rail",
     "train": "Rail",
     "hotel": "Hotel stay",
-    "accommodation": "Hotel stay",
 }
 
 WASTE_TYPE_ALIASES = {
     "waste": "General waste",
     "general waste": "General waste",
     "landfill": "Landfill waste",
-    "landfill waste": "Landfill waste",
     "recycling": "Recycling",
-    "recycled": "Recycling",
     "incineration": "Incineration",
-    "incinerated": "Incineration",
 }
 
-
-# =========================
-# CONSTANTS
-# =========================
 DEFAULT_FACTOR_YEAR = 2025
-SUPPORTED_CATEGORY_HINT = "Supported categories: fuel, electricity, water, business travel, waste."
-METADATA_FIELDS = [
-    "record_id",
-    "client_name",
-    "site_name",
-    "reporting_period",
-    "notes",
-    "source_file",
-    "row_index_original"
-]
+SUPPORTED_YEARS = [2023, 2024, 2025]
 
 
 # =========================
-# VALIDATION HELPERS
+# DEFRA FACTOR LIBRARY
 # =========================
-def validate_text_input(value, field_name):
-    if value is None:
-        raise ValueError(f"{field_name} is required.")
-    value = str(value).strip()
-    if value == "" or value.lower() == "nan":
-        raise ValueError(f"{field_name} is required.")
-    return value
+class DEFRAFactorLibrary:
+    """Centralized factor library supporting DEFRA 2023, 2024, and 2025."""
+    
+    def __init__(self):
+        self.electricity = pd.concat([
+            DEFRA_2023_ELECTRICITY, DEFRA_2024_ELECTRICITY, DEFRA_2025_ELECTRICITY
+        ], ignore_index=True)
+        
+        self.fuels = pd.concat([
+            DEFRA_2023_FUELS, DEFRA_2024_FUELS, DEFRA_2025_FUELS
+        ], ignore_index=True)
+        
+        self.vehicles = pd.concat([
+            DEFRA_2023_VEHICLES, DEFRA_2024_VEHICLES, DEFRA_2025_VEHICLES
+        ], ignore_index=True)
+        
+        self.water = pd.concat([
+            DEFRA_2023_WATER, DEFRA_2024_WATER, DEFRA_2025_WATER
+        ], ignore_index=True)
+        
+        self.waste = pd.concat([
+            DEFRA_2023_WASTE, DEFRA_2024_WASTE, DEFRA_2025_WASTE
+        ], ignore_index=True)
+    
+    def get_electricity_factor(self, country: str, unit: str, year: int) -> Optional[Tuple[float, str]]:
+        match = self.electricity[
+            (self.electricity["Country"].str.lower() == country.lower()) &
+            (self.electricity["Unit"].str.lower() == unit.lower()) &
+            (self.electricity["Year"] == year)
+        ]
+        if match.empty:
+            return None
+        row = match.iloc[0]
+        return float(row["kg CO2e"]), row["Source"]
+    
+    def get_fuel_factor(self, fuel: str, unit: str, year: int) -> Optional[Tuple[float, str]]:
+        match = self.fuels[
+            (self.fuels["Fuel"].str.lower() == fuel.lower()) &
+            (self.fuels["Unit"].str.lower() == unit.lower()) &
+            (self.fuels["Year"] == year)
+        ]
+        if match.empty:
+            return None
+        row = match.iloc[0]
+        return float(row["kg CO2e"]), row["Source"]
+    
+    def get_vehicle_factor(self, vehicle_type: str, unit: str, year: int) -> Optional[Tuple[float, str]]:
+        match = self.vehicles[
+            (self.vehicles["Vehicle Type"].str.lower() == vehicle_type.lower()) &
+            (self.vehicles["Unit"].str.lower() == unit.lower()) &
+            (self.vehicles["Year"] == year)
+        ]
+        if match.empty:
+            return None
+        row = match.iloc[0]
+        return float(row["kg CO2e"]), row["Source"]
+    
+    def get_water_factor(self, water_type: str, unit: str, year: int) -> Optional[Tuple[float, str]]:
+        match = self.water[
+            (self.water["Type"].str.lower() == water_type.lower()) &
+            (self.water["Unit"].str.lower() == unit.lower()) &
+            (self.water["Year"] == year)
+        ]
+        if match.empty:
+            return None
+        row = match.iloc[0]
+        return float(row["kg CO2e"]), row["Source"]
+    
+    def get_waste_factor(self, waste_type: str, unit: str, year: int) -> Optional[Tuple[float, str]]:
+        match = self.waste[
+            (self.waste["Waste Type"].str.lower() == waste_type.lower()) &
+            (self.waste["Unit"].str.lower() == unit.lower()) &
+            (self.waste["Year"] == year)
+        ]
+        if match.empty:
+            return None
+        row = match.iloc[0]
+        return float(row["kg CO2e"]), row["Source"]
+    
+    def list_supported_years(self) -> List[int]:
+        return sorted(self.electricity["Year"].unique().tolist())
+    
+    def list_factors_by_year(self, year: int) -> Dict[str, Any]:
+        return {
+            "year": year,
+            "electricity_factors": self.electricity[self.electricity["Year"] == year].to_dict(orient="records"),
+            "fuel_factors": self.fuels[self.fuels["Year"] == year].to_dict(orient="records"),
+            "vehicle_factors": self.vehicles[self.vehicles["Year"] == year].to_dict(orient="records"),
+            "water_factors": self.water[self.water["Year"] == year].to_dict(orient="records"),
+            "waste_factors": self.waste[self.waste["Year"] == year].to_dict(orient="records"),
+        }
 
 
-def validate_amount(amount):
-    if amount is None:
-        raise ValueError("amount is required.")
-    try:
-        if isinstance(amount, str):
-            amount = amount.replace(",", "").strip()
-        amount = float(amount)
-    except Exception:
-        raise ValueError("amount must be numeric.")
-    if amount < 0:
-        raise ValueError("amount cannot be negative.")
-    return amount
+DEFRA_LIBRARY = DEFRAFactorLibrary()
 
 
-def validate_year(year):
-    if year is None:
-        return DEFAULT_FACTOR_YEAR
-    try:
-        year = int(float(year))
-    except Exception:
-        raise ValueError("year must be an integer.")
-    if year < 1900 or year > 2100:
-        raise ValueError("year is out of valid range.")
-    return year
-
-
-def safe_text(value):
-    if value is None:
+# =========================
+# INTELLIGENT COLUMN DETECTOR
+# =========================
+class IntelligentColumnDetector:
+    """AI-powered column detection using fuzzy matching and pattern recognition."""
+    
+    @staticmethod
+    def similarity_ratio(a: str, b: str) -> float:
+        """Calculate similarity between two strings."""
+        return SequenceMatcher(None, a.lower(), b.lower()).ratio()
+    
+    @staticmethod
+    def extract_unit_from_header(header: str) -> Optional[str]:
+        """Extract unit from column header like 'Energy (kWh)' or 'Usage kWh'."""
+        # Pattern: (unit) or unit_at_end
+        patterns = [
+            r'\(([^)]+)\)',  # (kWh)
+            r'(?:in|of)\s+([a-zA-Z0-9.\s]+)$',  # in kWh
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, header, re.IGNORECASE)
+            if match:
+                unit_text = match.group(1).strip()
+                normalized = IntelligentColumnDetector.normalize_unit(unit_text)
+                if normalized:
+                    return normalized
         return None
-    value = str(value).strip()
-    if value == "" or value.lower() == "nan":
-        return None
-    return value
-
-
-def safe_float(value, default=0.0):
-    try:
-        if value is None:
-            return default
-        if isinstance(value, str):
-            value = value.replace(",", "").strip()
-        return float(value)
-    except Exception:
-        return default
-
-
-def is_blank(value):
-    if value is None:
-        return True
-    if isinstance(value, float) and pd.isna(value):
-        return True
-    if str(value).strip() == "":
-        return True
-    if str(value).strip().lower() == "nan":
-        return True
-    return False
+    
+    @staticmethod
+    def normalize_unit(unit_text: str) -> Optional[str]:
+        """Normalize unit text to standard format."""
+        unit_lower = unit_text.strip().lower()
+        return UNIT_ALIASES.get(unit_lower, None)
+    
+    @staticmethod
+    def detect_column_intent(header: str, sample_values: List[str]) -> Tuple[ColumnIntent, float]:
+        """
+        Detect the intent of a column using header and sample values.
+        Returns (ColumnIntent, confidence_score 0-1)
+        """
+        header_lower = header.lower()
+        
+        # Check header keywords
+        amount_score = max([IntelligentColumnDetector.similarity_ratio(header_lower, kw) for kw in AMOUNT_KEYWORDS], default=0)
+        unit_score = max([IntelligentColumnDetector.similarity_ratio(header_lower, kw) for kw in UNIT_KEYWORDS], default=0)
+        category_score = max([IntelligentColumnDetector.similarity_ratio(header_lower, kw) for kw in CATEGORY_KEYWORDS], default=0)
+        date_score = max([IntelligentColumnDetector.similarity_ratio(header_lower, kw) for kw in DATE_KEYWORDS], default=0)
+        vehicle_score = max([IntelligentColumnDetector.similarity_ratio(header_lower, kw) for kw in VEHICLE_KEYWORDS], default=0)
+        
+        # Check sample values
+        if sample_values:
+            sample_str = " ".join([str(v).lower() for v in sample_values[:5]])
+            
+            # Check for numeric patterns (amount)
+            if any(re.match(r'^\d+\.?\d*$', str(v).strip()) for v in sample_values if v):
+                amount_score = max(amount_score, 0.8)
+            
+            # Check for unit patterns
+            if any(str(v).lower() in ['kwh', 'kg', 'tonnes', 'litres', 'm3'] for v in sample_values if v):
+                unit_score = max(unit_score, 0.9)
+            
+            # Check for date patterns
+            if any(re.match(r'^\d{1,2}[/-]\d{1,2}|^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)', str(v).lower()) for v in sample_values if v):
+                date_score = max(date_score, 0.8)
+            
+            # Check for vehicle patterns
+            if any(str(v).lower() in list(VEHICLE_TYPE_ALIASES.keys()) for v in sample_values if v):
+                vehicle_score = max(vehicle_score, 0.9)
+            
+            # Check for category patterns
+            if any(str(v).lower() in list(CATEGORY_ALIASES.keys()) for v in sample_values if v):
+                category_score = max(category_score, 0.9)
+        
+        scores = {
+            ColumnIntent.AMOUNT: amount_score,
+            ColumnIntent.UNIT: unit_score,
+            ColumnIntent.CATEGORY: category_score,
+            ColumnIntent.DATE_PERIOD: date_score,
+            ColumnIntent.VEHICLE_TYPE: vehicle_score,
+        }
+        
+        best_intent = max(scores, key=scores.get)
+        best_score = scores[best_intent]
+        
+        return best_intent, best_score if best_score > 0.3 else 0.0
+    
+    @staticmethod
+    def auto_detect_columns(df: pd.DataFrame) -> Dict[str, Dict[str, Any]]:
+        """
+        Intelligent column detection for entire DataFrame.
+        Returns mapping of detected columns with confidence.
+        """
+        detected = {}
+        
+        for col in df.columns:
+            sample_values = df[col].dropna().head(5).tolist()
+            intent, confidence = IntelligentColumnDetector.detect_column_intent(col, sample_values)
+            
+            unit_from_header = IntelligentColumnDetector.extract_unit_from_header(col)
+            
+            detected[col] = {
+                "intent": intent,
+                "confidence": confidence,
+                "extracted_unit": unit_from_header,
+                "sample_values": sample_values[:3]
+            }
+        
+        return detected
 
 
 # =========================
-# AUTO-DETECTION & COLUMN MAPPING
+# CSV VALIDATION ENGINE
 # =========================
-def detect_and_remap_columns(df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, str]]:
-    """
-    Auto-detect and remap columns from flexible input formats.
+class CSVValidator:
+    """Pre-upload validation and remediation."""
     
-    Returns:
-        - Cleaned dataframe with standardized columns
-        - Mapping dict showing what was remapped
-    """
-    df_remapped = df.copy()
-    mapping_applied = {}
+    @staticmethod
+    def validate_csv(df: pd.DataFrame, required_intent: ColumnIntent = None) -> Dict[str, Any]:
+        """
+        Validate CSV structure before processing.
+        """
+        issues = []
+        warnings = []
+        column_detection = IntelligentColumnDetector.auto_detect_columns(df)
+        
+        # Check for completely empty rows
+        empty_rows = df.isna().sum(axis=1) == len(df.columns)
+        if empty_rows.any():
+            issues.append(f"Found {empty_rows.sum()} completely empty rows")
+        
+        # Check for numeric columns (amount detection)
+        numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+        if len(numeric_cols) == 0:
+            warnings.append("No numeric columns detected. Amount values may fail to parse.")
+        
+        # Validation summary
+        high_confidence_cols = [col for col, det in column_detection.items() if det["confidence"] > 0.7]
+        medium_confidence_cols = [col for col, det in column_detection.items() if 0.3 < det["confidence"] <= 0.7]
+        low_confidence_cols = [col for col, det in column_detection.items() if 0.0 < det["confidence"] <= 0.3]
+        
+        return {
+            "is_valid": len(issues) == 0,
+            "issues": issues,
+            "warnings": warnings,
+            "column_detection": column_detection,
+            "high_confidence_columns": high_confidence_cols,
+            "medium_confidence_columns": medium_confidence_cols,
+            "low_confidence_columns": low_confidence_cols,
+            "total_rows": len(df),
+            "suggested_actions": [
+                f"Confirm {len(medium_confidence_cols)} medium-confidence columns" if medium_confidence_cols else None,
+                f"Review {len(low_confidence_cols)} low-confidence columns" if low_confidence_cols else None,
+                f"Remove {empty_rows.sum()} empty rows" if empty_rows.any() else None
+            ]
+        }
     
-    original_cols = set(df_remapped.columns)
-    lower_cols = {col.lower(): col for col in df_remapped.columns}
-    
-    for alias, standard_col in COLUMN_ALIASES.items():
-        if standard_col not in df_remapped.columns:
-            if alias in lower_cols:
-                original_col = lower_cols[alias]
-                df_remapped = df_remapped.rename(columns={original_col: standard_col})
-                mapping_applied[original_col] = standard_col
-    
-    # If still no "amount" column, try to auto-detect numeric columns
-    if "amount" not in df_remapped.columns:
-        numeric_cols = df_remapped.select_dtypes(include=[np.number]).columns.tolist()
-        if numeric_cols:
-            first_numeric = numeric_cols[0]
-            df_remapped = df_remapped.rename(columns={first_numeric: "amount"})
-            mapping_applied[first_numeric] = "amount"
-    
-    return df_remapped, mapping_applied
+    @staticmethod
+    def suggest_column_mapping(df: pd.DataFrame) -> Dict[str, str]:
+        """
+        Suggest standard column names for detected intents.
+        """
+        column_detection = IntelligentColumnDetector.auto_detect_columns(df)
+        mapping = {}
+        
+        for col, det in column_detection.items():
+            intent = det["intent"]
+            confidence = det["confidence"]
+            
+            if intent == ColumnIntent.AMOUNT and confidence > 0.5:
+                mapping[col] = "amount"
+            elif intent == ColumnIntent.UNIT and confidence > 0.5:
+                mapping[col] = "unit"
+            elif intent == ColumnIntent.CATEGORY and confidence > 0.5:
+                mapping[col] = "category"
+            elif intent == ColumnIntent.DATE_PERIOD and confidence > 0.5:
+                mapping[col] = "reporting_period"
+            elif intent == ColumnIntent.VEHICLE_TYPE and confidence > 0.5:
+                mapping[col] = "vehicle_type"
+        
+        return mapping
 
 
-def auto_detect_category_from_data(row: Dict) -> Optional[str]:
-    """
-    Attempt to infer category from any available fields if explicit category is missing.
-    """
-    candidates = [
-        row.get("category"),
-        row.get("item_name"),
-        row.get("sub_category"),
-        row.get("notes"),
-        row.get("vehicle_type"),
-    ]
+# =========================
+# CSV TEMPLATE GENERATOR
+# =========================
+class CSVTemplateGenerator:
+    """Generate branded CSV templates."""
     
-    for val in candidates:
-        if val:
-            normalized = normalize_category(val)
-            if normalized:
-                return normalized
+    @staticmethod
+    def generate_template(company_name: str = "Your Company", brand_color: str = "#2E7D32") -> pd.DataFrame:
+        """Generate a branded CSV template with examples."""
+        template_data = {
+            "reporting_period": [
+                "April 2024", "April 2024", "April 2024",
+                "April 2024", "April 2024", "April 2024"
+            ],
+            "category": [
+                "Electricity", "Electricity", "Natural Gas",
+                "Business Travel", "Business Travel", "Business Travel"
+            ],
+            "item_name": [
+                "UK Grid Electricity", "UK Grid Electricity", "Natural Gas",
+                "Fleet Vehicle - VW ID3", "Fleet Vehicle - BMW 330e", "HGV - Mercedes Actros"
+            ],
+            "amount": [5200, 3100, 850, 1200, 950, 450],
+            "unit": ["kWh", "kWh", "kWh (Gross CV)", "vehicle_km", "vehicle_km", "vehicle_km"],
+            "notes": [
+                "Main office consumption",
+                "Warehouse consumption",
+                "Heating system",
+                "Electric vehicle - low emissions",
+                "Hybrid vehicle - mixed fuel",
+                "Heavy goods vehicle - transport"
+            ]
+        }
+        
+        df = pd.DataFrame(template_data)
+        return df
     
-    return None
+    @staticmethod
+    def export_template_to_csv(company_name: str = "Your Company") -> bytes:
+        """Export template as CSV bytes."""
+        df = CSVTemplateGenerator.generate_template(company_name)
+        csv_buffer = io.StringIO()
+        df.to_csv(csv_buffer, index=False)
+        return csv_buffer.getvalue().encode('utf-8')
+    
+    @staticmethod
+    def generate_template_with_instructions() -> str:
+        """Generate template with embedded instructions."""
+        instructions = """
+# Carbon Calculator - Data Upload Template
+# Generated: {date}
+# Company: Your Company Name
+# Reporting Period: April 2024
+
+## INSTRUCTIONS:
+# 1. Fill in the "reporting_period" column with the month/year you're reporting for
+# 2. Select a "category" from: Electricity, Natural Gas, Business Travel, Water, Waste
+# 3. Enter "item_name" (e.g., "Office Electricity", "VW ID3 Vehicle")
+# 4. Enter the numeric "amount" (consumption/usage value)
+# 5. Specify the "unit" (e.g., kWh, kg, vehicle_km, tonnes)
+# 6. Optional: Add notes for reference
+
+## SUPPORTED CATEGORIES & UNITS:
+
+# ELECTRICITY:
+# - Unit: kWh
+# - Example: reporting_period=April 2024, category=Electricity, item_name=Office, amount=5000, unit=kWh
+
+# NATURAL GAS:
+# - Unit: kWh (Gross CV), kWh (Net CV), cubic metres, tonnes
+# - Example: reporting_period=April 2024, category=Natural Gas, amount=850, unit=kWh (Gross CV)
+
+# BUSINESS TRAVEL:
+# - Unit: vehicle_km
+# - Vehicle Types: Petrol car, Diesel car, Electric car (BEV), Hybrid (HEV/PHEV), HGV (44 tonnes), Bus, Flight (short/medium/long-haul), Rail
+# - Example: reporting_period=April 2024, category=Business Travel, item_name=VW ID3, amount=1200, unit=vehicle_km
+
+# WATER:
+# - Unit: cubic metres, million litres
+# - Example: reporting_period=April 2024, category=Water, amount=120, unit=cubic metres
+
+# WASTE:
+# - Unit: kg, tonnes
+# - Waste Types: General waste, Landfill waste, Recycling, Incineration
+# - Example: reporting_period=April 2024, category=Waste, item_name=General waste, amount=250, unit=kg
+
+reporting_period,category,item_name,amount,unit,notes
+April 2024,Electricity,Office Electricity,5200,kWh,Main office building
+April 2024,Electricity,Warehouse,3100,kWh,Secondary location
+April 2024,Natural Gas,Building Heating,850,kWh (Gross CV),Gas boiler
+April 2024,Business Travel,VW ID3,1200,vehicle_km,Electric company vehicle
+April 2024,Business Travel,BMW 330e,950,vehicle_km,Hybrid company vehicle
+April 2024,Business Travel,Mercedes Actros HGV,450,vehicle_km,Heavy goods transport
+""".format(date=datetime.now().strftime("%Y-%m-%d"))
+        
+        return instructions
 
 
 # =========================
 # NORMALIZATION HELPERS
 # =========================
-def normalize_fuel(fuel):
-    key = str(fuel).strip().lower()
-    return FUEL_ALIASES.get(key, fuel)
-
-
 def normalize_unit(unit):
     if not unit:
         return unit
@@ -416,62 +683,74 @@ def normalize_waste_type(value):
 
 
 # =========================
-# INFERENCE HELPERS
+# VALIDATION HELPERS
 # =========================
-def infer_canonical_category(activity):
-    """Improved inference that checks multiple sources."""
-    raw_category = safe_text(activity.get("category"))
-    inferred = auto_detect_category_from_data(activity)
-    
-    if inferred:
-        return {
-            "raw_category": raw_category,
-            "canonical_category": inferred,
-            "mapping_source": "category" if raw_category else "inferred",
-            "mapping_confidence": "high" if raw_category else "medium"
-        }
-    
-    return {
-        "raw_category": raw_category,
-        "canonical_category": None,
-        "mapping_source": "unmapped",
-        "mapping_confidence": "low"
-    }
+def validate_text_input(value, field_name):
+    if value is None:
+        raise ValueError(f"{field_name} is required.")
+    value = str(value).strip()
+    if value == "" or value.lower() == "nan":
+        raise ValueError(f"{field_name} is required.")
+    return value
 
 
-def classify_calculation_basis(mapping_source, factor_quality):
-    if factor_quality == "official" and mapping_source == "category":
-        return "exact"
-    if factor_quality == "official" and mapping_source == "inferred":
-        return "estimated"
-    return "estimated"
+def validate_amount(amount):
+    if amount is None:
+        raise ValueError("amount is required.")
+    try:
+        if isinstance(amount, str):
+            amount = amount.replace(",", "").strip()
+        amount = float(amount)
+    except Exception:
+        raise ValueError("amount must be numeric.")
+    if amount < 0:
+        raise ValueError("amount cannot be negative.")
+    return amount
+
+
+def validate_year(year, default=DEFAULT_FACTOR_YEAR):
+    if year is None:
+        return default
+    try:
+        year = int(float(year))
+    except Exception:
+        raise ValueError(f"year must be an integer. Supported: {SUPPORTED_YEARS}")
+    if year not in SUPPORTED_YEARS:
+        raise ValueError(f"year {year} not supported. Supported: {SUPPORTED_YEARS}")
+    return year
+
+
+def safe_text(value):
+    if value is None:
+        return None
+    value = str(value).strip()
+    if value == "" or value.lower() == "nan":
+        return None
+    return value
+
+
+def is_blank(value):
+    if value is None:
+        return True
+    if isinstance(value, float) and pd.isna(value):
+        return True
+    if str(value).strip() == "":
+        return True
+    if str(value).strip().lower() == "nan":
+        return True
+    return False
 
 
 # =========================
-# OUTPUT HELPER
+# OUTPUT BUILDER
 # =========================
 def build_result_row(
-    category,
-    sub_category,
-    item_name,
-    scope,
-    input_amount,
-    input_unit,
-    normalized_unit,
-    emission_factor,
-    factor_year,
-    emissions_kg,
-    data_source="DEFRA 2025",
-    factor_name=None,
-    factor_description=None,
-    factor_quality="official",
-    original_category=None,
-    mapping_source=None,
-    mapping_confidence=None,
-    defra_reference=None,
+    category, sub_category, item_name, scope, input_amount, input_unit, normalized_unit,
+    emission_factor, factor_year, emissions_kg, data_source="DEFRA", factor_name=None,
+    defra_reference=None, original_category=None, mapping_source=None, mapping_confidence=None,
 ):
-    calculation_basis = classify_calculation_basis(mapping_source, factor_quality)
-
+    calculation_basis = "exact" if mapping_source == "category" else "estimated"
+    
     return pd.DataFrame([{
         "category": category,
         "sub_category": sub_category,
@@ -487,8 +766,6 @@ def build_result_row(
         "data_source": data_source,
         "defra_reference": defra_reference,
         "factor_name": factor_name or item_name,
-        "factor_description": factor_description or "",
-        "factor_quality": factor_quality,
         "original_category": original_category,
         "mapping_source": mapping_source,
         "mapping_confidence": mapping_confidence,
@@ -497,80 +774,103 @@ def build_result_row(
 
 
 # =========================
-# CALCULATORS (IMPROVED)
+# CALCULATORS
 # =========================
-def calculate_electricity_emissions_unified(
-    df,
-    country,
-    unit,
-    amount,
-    year=DEFAULT_FACTOR_YEAR,
-    original_category=None,
-    mapping_source=None,
-    mapping_confidence=None
+def calculate_electricity_emissions(
+    country, unit, amount, year=DEFAULT_FACTOR_YEAR,
+    original_category=None, mapping_source=None, mapping_confidence=None
 ):
-    """Improved to handle flexible unit inputs."""
     country = validate_text_input(country, "country")
     unit = validate_text_input(unit, "unit")
     amount = validate_amount(amount)
     year = validate_year(year)
 
     unit_normalized = normalize_unit(unit)
-
-    match = df[
-        (df["Country"].str.strip().str.lower() == country.strip().lower()) &
-        (df["Unit"].str.strip().str.lower() == unit_normalized.strip().lower()) &
-        (df["Year"] == year)
-    ].copy()
-
-    if match.empty:
+    
+    result = DEFRA_LIBRARY.get_electricity_factor(country, unit_normalized, year)
+    
+    if not result:
         raise ValueError(
-            f"No matching electricity factor found for Country='{country}', Unit='{unit_normalized}', Year={year}"
+            f"No matching electricity factor found for Country='{country}', Unit='{unit_normalized}', Year={year}. "
+            f"Supported years: {SUPPORTED_YEARS}"
         )
-
-    row = match.iloc[0]
-    factor = float(row["kg CO2e"])
+    
+    factor, defra_source = result
     emissions_kg = amount * factor
 
     return build_result_row(
         category="Electricity",
-        sub_category=row["Activity"],
-        item_name=row["Country"],
+        sub_category="Electricity generated",
+        item_name=country,
         scope="Scope 2",
         input_amount=amount,
         input_unit=unit,
-        normalized_unit=row["Unit"],
+        normalized_unit=unit_normalized,
         emission_factor=factor,
-        factor_year=int(row["Year"]),
+        factor_year=year,
         emissions_kg=emissions_kg,
-        data_source="DEFRA 2025",
-        factor_name=f"{row['Country']} / {row['Unit']}",
-        factor_description="Location-based electricity factor",
-        factor_quality="official",
+        data_source=defra_source,
+        factor_name=f"{country} / {unit_normalized}",
+        defra_reference=defra_source,
         original_category=original_category,
         mapping_source=mapping_source,
         mapping_confidence=mapping_confidence,
-        defra_reference="DEFRA 2025 Electricity Grid Factor"
     )
 
 
-def calculate_vehicle_emissions_unified(
-    df,
-    vehicle_type,
-    unit,
-    amount,
-    factor_year=DEFAULT_FACTOR_YEAR,
-    original_category=None,
-    mapping_source=None,
-    mapping_confidence=None
+def calculate_fuel_emissions(
+    fuel, unit, amount, year=DEFAULT_FACTOR_YEAR,
+    original_category=None, mapping_source=None, mapping_confidence=None
 ):
-    """NEW: Specific vehicle-class calculations with DEFRA factors."""
+    fuel = validate_text_input(fuel, "fuel")
+    unit = validate_text_input(unit, "unit")
+    amount = validate_amount(amount)
+    year = validate_year(year)
+
+    unit_normalized = normalize_unit(unit)
+    
+    result = DEFRA_LIBRARY.get_fuel_factor(fuel, unit_normalized, year)
+    
+    if not result:
+        raise ValueError(
+            f"No matching fuel factor found for Fuel='{fuel}', Unit='{unit_normalized}', Year={year}. "
+            f"Supported years: {SUPPORTED_YEARS}"
+        )
+    
+    factor, defra_source = result
+    emissions_kg = amount * factor
+
+    return build_result_row(
+        category="Fuel",
+        sub_category="Gaseous fuels",
+        item_name=fuel,
+        scope="Scope 1",
+        input_amount=amount,
+        input_unit=unit,
+        normalized_unit=unit_normalized,
+        emission_factor=factor,
+        factor_year=year,
+        emissions_kg=emissions_kg,
+        data_source=defra_source,
+        factor_name=f"{fuel} / {unit_normalized}",
+        defra_reference=defra_source,
+        original_category=original_category,
+        mapping_source=mapping_source,
+        mapping_confidence=mapping_confidence,
+    )
+
+
+def calculate_vehicle_emissions(
+    vehicle_type, unit, amount, year=DEFAULT_FACTOR_YEAR,
+    original_category=None, mapping_source=None, mapping_confidence=None
+):
     vehicle_type = validate_text_input(vehicle_type, "vehicle_type")
     unit = validate_text_input(unit, "unit")
     amount = validate_amount(amount)
+    year = validate_year(year)
 
-    vehicle_normalized = normalize_vehicle_type(vehicle_type)
     unit_normalized = normalize_unit(unit)
+    vehicle_normalized = normalize_vehicle_type(vehicle_type)
 
     if not vehicle_normalized:
         raise ValueError(
@@ -578,561 +878,220 @@ def calculate_vehicle_emissions_unified(
             f"Supported: Petrol car, Diesel car, Electric car (BEV), Hybrid (HEV/PHEV), "
             f"HGV (44 tonnes), Light commercial vehicle, Bus, Flight (short/medium/long-haul), Rail, Hotel stay."
         )
-
-    match = df[
-        (df["Vehicle Type"].str.strip().str.lower() == vehicle_normalized.strip().lower()) &
-        (df["Unit"].str.strip().str.lower() == unit_normalized.strip().lower())
-    ].copy()
-
-    if match.empty:
+    
+    result = DEFRA_LIBRARY.get_vehicle_factor(vehicle_normalized, unit_normalized, year)
+    
+    if not result:
         raise ValueError(
-            f"No matching vehicle factor found for '{vehicle_normalized}' with unit '{unit_normalized}'. "
-            f"Please check vehicle type and unit combination."
+            f"No matching vehicle factor found for '{vehicle_normalized}' with unit '{unit_normalized}' in year {year}. "
+            f"Supported years: {SUPPORTED_YEARS}"
         )
-
-    row = match.iloc[0]
-    factor = float(row["kg CO2e"])
+    
+    factor, defra_source = result
     emissions_kg = amount * factor
 
     return build_result_row(
         category="Business Travel",
-        sub_category=row["Activity"],
-        item_name=row["Vehicle Type"],
-        scope=row["Scope"],
+        sub_category="Business travel",
+        item_name=vehicle_normalized,
+        scope="Scope 3",
         input_amount=amount,
         input_unit=unit,
-        normalized_unit=row["Unit"],
+        normalized_unit=unit_normalized,
         emission_factor=factor,
-        factor_year=factor_year,
+        factor_year=year,
         emissions_kg=emissions_kg,
-        data_source="DEFRA 2025",
-        factor_name=f"{row['Vehicle Type']} / {row['Unit']}",
-        factor_description=f"Vehicle-specific factor: {row['Vehicle Type']}",
-        factor_quality="official",
+        data_source=defra_source,
+        factor_name=f"{vehicle_normalized} / {unit_normalized}",
+        defra_reference=defra_source,
         original_category=original_category,
         mapping_source=mapping_source,
         mapping_confidence=mapping_confidence,
-        defra_reference=row.get("DEFRA Source", "DEFRA 2025")
     )
 
 
-def calculate_fuel_emissions_unified(
-    df,
-    fuel,
-    unit,
-    amount,
-    factor_year=DEFAULT_FACTOR_YEAR,
-    original_category=None,
-    mapping_source=None,
-    mapping_confidence=None
-):
-    fuel = validate_text_input(fuel, "fuel")
-    unit = validate_text_input(unit, "unit")
-    amount = validate_amount(amount)
-
-    fuel_normalized = normalize_fuel(fuel)
-    unit_normalized = normalize_unit(unit)
-
-    match = df[
-        (df["Fuel"].str.strip().str.lower() == fuel_normalized.strip().lower()) &
-        (df["Unit"].str.strip().str.lower() == unit_normalized.strip().lower())
-    ].copy()
-
-    if match.empty:
-        raise ValueError(
-            f"No matching factor found for Fuel='{fuel}' "
-            f"(normalized='{fuel_normalized}') and Unit='{unit}' "
-            f"(normalized='{unit_normalized}')"
-        )
-
-    row = match.iloc[0]
-    factor = float(row["kg CO2e"])
-    emissions_kg = amount * factor
-
-    return build_result_row(
-        category="Fuel",
-        sub_category=row["Activity"],
-        item_name=row["Fuel"],
-        scope="Scope 1",
-        input_amount=amount,
-        input_unit=unit,
-        normalized_unit=row["Unit"],
-        emission_factor=factor,
-        factor_year=factor_year,
-        emissions_kg=emissions_kg,
-        data_source="DEFRA 2025",
-        factor_name=f"{row['Fuel']} / {row['Unit']}",
-        factor_description="Fuel combustion factor",
-        factor_quality="official",
-        original_category=original_category,
-        mapping_source=mapping_source,
-        mapping_confidence=mapping_confidence,
-        defra_reference="DEFRA 2025 Fuel Factors"
-    )
-
-
-def calculate_water_emissions_unified(
-    df,
-    water_type,
-    unit,
-    amount,
-    factor_year=DEFAULT_FACTOR_YEAR,
-    original_category=None,
-    mapping_source=None,
-    mapping_confidence=None
+def calculate_water_emissions(
+    water_type, unit, amount, year=DEFAULT_FACTOR_YEAR,
+    original_category=None, mapping_source=None, mapping_confidence=None
 ):
     water_type = validate_text_input(water_type, "water_type")
     unit = validate_text_input(unit, "unit")
     amount = validate_amount(amount)
+    year = validate_year(year)
 
     unit_normalized = normalize_unit(unit)
-
-    match = df[
-        (df["Type"].str.strip().str.lower() == water_type.strip().lower()) &
-        (df["Unit"].str.strip().str.lower() == unit_normalized.strip().lower())
-    ].copy()
-
-    if match.empty:
+    
+    result = DEFRA_LIBRARY.get_water_factor(water_type, unit_normalized, year)
+    
+    if not result:
         raise ValueError(
-            f"No matching water factor found for Type='{water_type}' and Unit='{unit_normalized}'"
+            f"No matching water factor found for Type='{water_type}', Unit='{unit_normalized}', Year={year}. "
+            f"Supported years: {SUPPORTED_YEARS}"
         )
-
-    row = match.iloc[0]
-    factor = float(row["kg CO2e"])
+    
+    factor, defra_source = result
     emissions_kg = amount * factor
 
     return build_result_row(
         category="Water",
-        sub_category=row["Activity"],
-        item_name=row["Type"],
+        sub_category="Water supply",
+        item_name=water_type,
         scope="Scope 3",
         input_amount=amount,
         input_unit=unit,
-        normalized_unit=row["Unit"],
+        normalized_unit=unit_normalized,
         emission_factor=factor,
-        factor_year=factor_year,
+        factor_year=year,
         emissions_kg=emissions_kg,
-        data_source="DEFRA 2025",
-        factor_name=f"{row['Type']} / {row['Unit']}",
-        factor_description="Water supply factor",
-        factor_quality="official",
+        data_source=defra_source,
+        factor_name=f"{water_type} / {unit_normalized}",
+        defra_reference=defra_source,
         original_category=original_category,
         mapping_source=mapping_source,
         mapping_confidence=mapping_confidence,
-        defra_reference="DEFRA 2025 Water Factors"
     )
 
 
-def calculate_waste_emissions_unified(
-    df,
-    waste_type,
-    unit,
-    amount,
-    factor_year=DEFAULT_FACTOR_YEAR,
-    original_category=None,
-    mapping_source=None,
-    mapping_confidence=None
+def calculate_waste_emissions(
+    waste_type, unit, amount, year=DEFAULT_FACTOR_YEAR,
+    original_category=None, mapping_source=None, mapping_confidence=None
 ):
     waste_type = validate_text_input(waste_type, "waste_type")
     unit = validate_text_input(unit, "unit")
     amount = validate_amount(amount)
+    year = validate_year(year)
 
     unit_normalized = normalize_unit(unit)
-
-    match = df[
-        (df["Waste Type"].str.strip().str.lower() == waste_type.strip().lower()) &
-        (df["Unit"].str.strip().str.lower() == unit_normalized.strip().lower())
-    ].copy()
-
-    if match.empty:
+    waste_normalized = normalize_waste_type(waste_type) or waste_type
+    
+    result = DEFRA_LIBRARY.get_waste_factor(waste_normalized, unit_normalized, year)
+    
+    if not result:
         raise ValueError(
-            f"No matching waste factor found for Waste Type='{waste_type}' and Unit='{unit_normalized}'. "
-            f"Expected example units include: tonnes, kg."
+            f"No matching waste factor found for Type='{waste_normalized}', Unit='{unit_normalized}', Year={year}. "
+            f"Supported years: {SUPPORTED_YEARS}"
         )
-
-    row = match.iloc[0]
-    factor = float(row["kg CO2e"])
+    
+    factor, defra_source = result
     emissions_kg = amount * factor
 
     return build_result_row(
         category="Waste",
-        sub_category=row["Activity"],
-        item_name=row["Waste Type"],
-        scope=row["Scope"],
+        sub_category="Waste generated",
+        item_name=waste_normalized,
+        scope="Scope 3",
         input_amount=amount,
         input_unit=unit,
-        normalized_unit=row["Unit"],
+        normalized_unit=unit_normalized,
         emission_factor=factor,
-        factor_year=factor_year,
+        factor_year=year,
         emissions_kg=emissions_kg,
-        data_source="DEFRA 2025",
-        factor_name=f"{row['Waste Type']} / {row['Unit']}",
-        factor_description="Waste disposal factor",
-        factor_quality="official",
+        data_source=defra_source,
+        factor_name=f"{waste_normalized} / {unit_normalized}",
+        defra_reference=defra_source,
         original_category=original_category,
         mapping_source=mapping_source,
         mapping_confidence=mapping_confidence,
-        defra_reference="DEFRA 2025 Waste Factors"
     )
 
 
 # =========================
-# PREPROCESSING
-# =========================
-def preprocess_uploaded_dataframe(df):
-    """Enhanced preprocessing with column auto-detection."""
-    df_clean, col_mapping = detect_and_remap_columns(df)
-    
-    object_cols = df_clean.select_dtypes(include=["object"]).columns
-    for col in object_cols:
-        df_clean[col] = df_clean[col].apply(lambda x: x.strip() if isinstance(x, str) else x)
-
-    df_clean = df_clean.replace(r"^\s*$", None, regex=True)
-
-    if "category" in df_clean.columns:
-        df_clean["category"] = df_clean["category"].apply(
-            lambda x: x.lower() if isinstance(x, str) else x
-        )
-
-    if "unit" in df_clean.columns:
-        df_clean["unit"] = df_clean["unit"].apply(
-            lambda x: normalize_unit(x) if isinstance(x, str) else x
-        )
-
-    if "fuel" in df_clean.columns:
-        df_clean["fuel"] = df_clean["fuel"].apply(
-            lambda x: normalize_fuel(x) if isinstance(x, str) else x
-        )
-
-    df_clean = df_clean.where(pd.notnull(df_clean), None)
-    
-    return df_clean, col_mapping
-
-
-# =========================
-# DISPATCHER (IMPROVED)
+# DISPATCHER WITH SMART MAPPING
 # =========================
 def calculate_emissions(activity):
-    """Improved dispatcher with vehicle-specific routing."""
-    mapping = infer_canonical_category(activity)
-
-    original_category = mapping["raw_category"]
-    canonical_category = mapping["canonical_category"]
-    mapping_source = mapping["mapping_source"]
-    mapping_confidence = mapping["mapping_confidence"]
+    """Route to appropriate calculator with smart mapping."""
+    raw_category = safe_text(activity.get("category"))
+    canonical_category = normalize_category(raw_category)
 
     if not canonical_category:
         raise ValueError(
-            f"Unsupported or unmapped category: '{original_category}'. {SUPPORTED_CATEGORY_HINT}"
+            f"Unsupported or unmapped category: '{raw_category}'. "
+            f"Supported: fuel, electricity, water, business travel, waste."
         )
 
     unit = activity.get("unit")
     amount = activity.get("amount")
+    year = activity.get("year", activity.get("factor_year", DEFAULT_FACTOR_YEAR))
+
+    mapping_source = "category"
+    mapping_confidence = "high"
 
     if canonical_category == "fuel":
-        fuel = activity.get("fuel") or activity.get("item_name") or activity.get("sub_category") or "Natural gas"
-        return calculate_fuel_emissions_unified(
-            df=df_fuels_clean,
-            fuel=fuel,
-            unit=unit,
-            amount=amount,
-            factor_year=activity.get("factor_year", DEFAULT_FACTOR_YEAR),
-            original_category=original_category,
-            mapping_source=mapping_source,
+        fuel = activity.get("fuel") or activity.get("item_name") or "Natural gas"
+        return calculate_fuel_emissions(
+            fuel=fuel, unit=unit, amount=amount, year=year,
+            original_category=raw_category, mapping_source=mapping_source,
             mapping_confidence=mapping_confidence
         )
 
-    if canonical_category == "electricity":
+    elif canonical_category == "electricity":
         country = activity.get("country") or activity.get("item_name") or "Electricity: UK"
         unit = unit or "kWh"
-        return calculate_electricity_emissions_unified(
-            df=df_electricity_clean,
-            country=country,
-            unit=unit,
-            amount=amount,
-            year=activity.get("year", DEFAULT_FACTOR_YEAR),
-            original_category=original_category,
-            mapping_source=mapping_source,
+        return calculate_electricity_emissions(
+            country=country, unit=unit, amount=amount, year=year,
+            original_category=raw_category, mapping_source=mapping_source,
             mapping_confidence=mapping_confidence
         )
 
-    if canonical_category == "water":
+    elif canonical_category == "water":
         water_type = activity.get("water_type") or activity.get("item_name") or "Water supply"
-        return calculate_water_emissions_unified(
-            df=df_water_clean,
-            water_type=water_type,
-            unit=unit,
-            amount=amount,
-            factor_year=activity.get("factor_year", DEFAULT_FACTOR_YEAR),
-            original_category=original_category,
-            mapping_source=mapping_source,
+        return calculate_water_emissions(
+            water_type=water_type, unit=unit, amount=amount, year=year,
+            original_category=raw_category, mapping_source=mapping_source,
             mapping_confidence=mapping_confidence
         )
 
-    if canonical_category == "business travel":
-        # NEW: Check if vehicle_type is specified for vehicle-specific calculation
+    elif canonical_category == "business travel":
         vehicle_type = activity.get("vehicle_type") or activity.get("item_name")
+        if not vehicle_type:
+            raise ValueError("Business travel requires vehicle_type (e.g., 'Electric car (BEV)', 'HGV (44 tonnes)')")
         
-        if vehicle_type:
-            normalized_vehicle = normalize_vehicle_type(vehicle_type)
-            if normalized_vehicle:
-                return calculate_vehicle_emissions_unified(
-                    df=df_vehicle_emissions,
-                    vehicle_type=vehicle_type,
-                    unit=unit,
-                    amount=amount,
-                    factor_year=activity.get("factor_year", DEFAULT_FACTOR_YEAR),
-                    original_category=original_category,
-                    mapping_source=mapping_source,
-                    mapping_confidence=mapping_confidence
-                )
-        
-        # Fallback to generic if no vehicle type
-        raise ValueError(
-            f"Business travel requires vehicle_type. "
-            f"Supported: Petrol car, Diesel car, Electric car (BEV), Hybrid (HEV/PHEV), "
-            f"HGV (44 tonnes), Light commercial vehicle, Bus, Flight, Rail, Hotel stay."
-        )
-
-    if canonical_category == "waste":
-        waste_type = activity.get("waste_type") or activity.get("item_name") or "General waste"
-        normalized_waste = normalize_waste_type(waste_type)
-        if not normalized_waste:
-            normalized_waste = waste_type
-        
-        return calculate_waste_emissions_unified(
-            df=df_waste_clean,
-            waste_type=normalized_waste,
-            unit=unit,
-            amount=amount,
-            factor_year=activity.get("factor_year", DEFAULT_FACTOR_YEAR),
-            original_category=original_category,
-            mapping_source=mapping_source,
+        return calculate_vehicle_emissions(
+            vehicle_type=vehicle_type, unit=unit, amount=amount, year=year,
+            original_category=raw_category, mapping_source=mapping_source,
             mapping_confidence=mapping_confidence
         )
 
-    raise ValueError(
-        f"Unsupported category: '{original_category}'. {SUPPORTED_CATEGORY_HINT}"
-    )
+    elif canonical_category == "waste":
+        waste_type = activity.get("waste_type") or activity.get("item_name") or "General waste"
+        return calculate_waste_emissions(
+            waste_type=waste_type, unit=unit, amount=amount, year=year,
+            original_category=raw_category, mapping_source=mapping_source,
+            mapping_confidence=mapping_confidence
+        )
+
+    raise ValueError(f"Unsupported category: '{raw_category}'")
 
 
 # =========================
-# ERROR GROUPING / QUALITY
+# BATCH PROCESSING WITH AUTO-MAPPING
 # =========================
-def infer_issue_type_from_message(message):
-    msg = str(message or "").lower()
-
-    if "unmapped category" in msg or "unsupported category" in msg:
-        return "Unmapped category"
-    if "amount is required" in msg:
-        return "Missing amount"
-    if "must be numeric" in msg:
-        return "Non-numeric amount"
-    if "cannot be negative" in msg:
-        return "Negative amount"
-    if "unit is required" in msg:
-        return "Missing unit"
-    if "no matching" in msg or "factor" in msg:
-        return "Factor matching failure"
-    if "year must be" in msg or "year is out of valid range" in msg:
-        return "Invalid year"
-    if "required" in msg:
-        return "Missing required field"
-    if "unknown vehicle" in msg or "vehicle type" in msg:
-        return "Invalid vehicle type"
-    return "Other validation issue"
-
-
-def infer_severity(issue_type, count=1):
-    high_types = {
-        "Unmapped category",
-        "Factor matching failure",
-        "Missing required field",
-        "Missing unit",
-        "Missing amount",
-        "Non-numeric amount",
-        "Invalid vehicle type",
-    }
-    medium_types = {
-        "Invalid year",
-        "Negative amount",
-        "Other validation issue",
-    }
-
-    if issue_type in high_types:
-        return "high"
-    if issue_type in medium_types:
-        return "medium"
-    if count >= 10:
-        return "high"
-    if count >= 3:
-        return "medium"
-    return "low"
-
-
-def infer_issue_guidance(issue_type):
-    guidance_map = {
-        "Unmapped category": "Standardise the category labels in the source data so they match the calculator taxonomy.",
-        "Missing amount": "Add a valid numeric amount for the affected rows before re-uploading.",
-        "Non-numeric amount": "Replace text or malformed values in the amount field with clean numeric values.",
-        "Negative amount": "Check whether the input quantity should be positive.",
-        "Missing unit": "Populate the missing unit. Supported: kWh, vehicle_km, passenger_km, tonnes, room_nights, gbp, etc.",
-        "Factor matching failure": "Review category, vehicle type, and unit combination for correctness.",
-        "Invalid year": "Use a valid integer year within the supported range (1900-2100).",
-        "Missing required field": "Complete the missing required columns before submitting.",
-        "Invalid vehicle type": "Use a supported vehicle type: Petrol car, Diesel car, Electric car (BEV), Hybrid, HGV, Bus, Flight, Rail, Hotel stay.",
-        "Other validation issue": "Review the affected rows and correct the source data before re-uploading."
-    }
-    return guidance_map.get(issue_type, "Review the affected rows and correct the source data before re-uploading.")
-
-
-def group_errors(errors):
-    if not errors:
-        return []
-
-    grouped = {}
-
-    for err in errors:
-        issue_type = infer_issue_type_from_message(err.get("error"))
-        if issue_type not in grouped:
-            grouped[issue_type] = {
-                "title": issue_type,
-                "count": 0,
-                "severity": "low",
-                "guidance": infer_issue_guidance(issue_type),
-                "examples": []
-            }
-
-        grouped[issue_type]["count"] += 1
-
-        example_bits = []
-        if err.get("source_file"):
-            example_bits.append(f"[{err['source_file']}]")
-        if err.get("row_index_original") is not None:
-            example_bits.append(f"row {err['row_index_original']}")
-        elif err.get("row_index") is not None:
-            example_bits.append(f"row {err['row_index']}")
-        if err.get("error"):
-            example_bits.append(err["error"])
-
-        example_text = " - ".join(example_bits).strip()
-        if example_text and len(grouped[issue_type]["examples"]) < 5:
-            grouped[issue_type]["examples"].append(example_text)
-
-    for issue_type, item in grouped.items():
-        item["severity"] = infer_severity(issue_type, item["count"])
-
-    grouped_list = list(grouped.values())
-    severity_order = {"high": 0, "medium": 1, "low": 2}
-    grouped_list.sort(key=lambda x: (severity_order.get(x["severity"], 9), -x["count"], x["title"]))
-
-    return grouped_list
-
-
-def build_error_summary(errors):
-    grouped = group_errors(errors)
-    return [{"error": item["title"], "count": item["count"]} for item in grouped]
-
-
-def build_errors_preview(errors, max_items=10):
-    return errors[:max_items]
-
-
-def calculate_confidence_score(report_df, data_quality):
-    total_rows = int(data_quality.get("total_rows", 0) or 0)
-    coverage_percent = float(data_quality.get("coverage_percent", 0.0) or 0.0)
-    inferred_rows = int(data_quality.get("inferred_category_rows", 0) or 0)
-    estimated_rows = int(data_quality.get("estimated_rows", 0) or 0)
-
-    if total_rows <= 0:
-        return {
-            "score": 0,
-            "label": "Low",
-            "coverage_percent": 0.0,
-            "notes": ["No valid rows were available for calculation."]
-        }
-
-    score = 100.0
-    score -= max(0.0, 100.0 - coverage_percent) * 0.50
-    score -= (inferred_rows / total_rows) * 10.0
-    score -= (estimated_rows / total_rows) * 15.0
-
-    score = round(max(0.0, min(100.0, score)), 0)
-
-    if score >= 85:
-        label = "High"
-    elif score >= 65:
-        label = "Moderate"
-    else:
-        label = "Low"
-
-    notes = []
-    if coverage_percent >= 95:
-        notes.append("Most rows were processed successfully.")
-    elif coverage_percent > 0:
-        notes.append("Some rows were excluded due to validation or factor-matching issues.")
-
-    if inferred_rows > 0:
-        notes.append(f"{inferred_rows} row(s) relied on inferred category mapping.")
-    if estimated_rows > 0:
-        notes.append(f"{estimated_rows} row(s) used estimated or non-exact treatment.")
-
-    if not notes:
-        notes.append("All rows processed with official DEFRA factors.")
-
-    return {
-        "score": int(score),
-        "label": label,
-        "coverage_percent": coverage_percent,
-        "notes": notes
-    }
-
-
-# =========================
-# BATCH PROCESSING
-# =========================
-def calculate_emissions_batch_safe(activity_list):
+def calculate_emissions_batch_safe(activity_list, auto_map=True):
+    """Process batch with optional auto-mapping."""
     results = []
     errors = []
-    category_mapping_rows = []
-    unmapped_categories = []
+    mapping_log = {}
 
     for i, activity in enumerate(activity_list):
         try:
             activity_data = activity.copy()
-
-            metadata = {field: activity.get(field, None) for field in METADATA_FIELDS}
-            mapping = infer_canonical_category(activity_data)
-
-            category_mapping_rows.append({
-                "row_index": i,
-                "original_category": mapping.get("raw_category"),
-                "canonical_category": mapping.get("canonical_category"),
-                "mapping_source": mapping.get("mapping_source"),
-                "mapping_confidence": mapping.get("mapping_confidence")
-            })
-
-            if not mapping.get("canonical_category"):
-                unmapped_categories.append(mapping.get("raw_category"))
-                raise ValueError(
-                    f"Unsupported or unmapped category: '{mapping.get('raw_category')}'. {SUPPORTED_CATEGORY_HINT}"
-                )
-
             result = calculate_emissions(activity_data)
-            result = result.copy()
             result["row_index"] = i
-
-            for field, value in metadata.items():
-                result[field] = value
-
             results.append(result)
+            
+            # Log mapping
+            item_name = result.iloc[0]["item_name"]
+            mapping_log[i] = {
+                "input": activity_data,
+                "mapped_to": item_name,
+                "category": result.iloc[0]["category"],
+                "emissions_kgCO2e": float(result.iloc[0]["emissions_kgCO2e"])
+            }
 
         except Exception as e:
             errors.append({
                 "row_index": i,
                 "row_index_original": activity.get("row_index_original", i + 1),
-                "source_file": activity.get("source_file"),
-                "original_category": activity.get("category"),
                 "input": activity,
                 "error": str(e)
             })
@@ -1148,47 +1107,14 @@ def calculate_emissions_batch_safe(activity_list):
 
     total_rows = len(activity_list)
     successful_rows = len(final_report)
-    errored_rows = len(errors)
     coverage_percent = round((successful_rows / total_rows) * 100, 2) if total_rows > 0 else 0.0
-
-    mapping_df = pd.DataFrame(category_mapping_rows)
-    if not mapping_df.empty:
-        mapped_rows = int(mapping_df["canonical_category"].notna().sum())
-        inferred_rows = int((mapping_df["mapping_source"] == "inferred").sum())
-    else:
-        mapped_rows = 0
-        inferred_rows = 0
-
-    unmapped_summary = []
-    if unmapped_categories:
-        unmapped_df = pd.Series(unmapped_categories, dtype="object").fillna("blank").value_counts().reset_index()
-        unmapped_df.columns = ["category", "count"]
-        unmapped_summary = unmapped_df.to_dict(orient="records")
-
-    exact_factor_rows = 0
-    estimated_rows = 0
-    official_factor_rows = 0
-
-    if not final_report.empty:
-        exact_factor_rows = int((final_report["calculation_basis"] == "exact").sum()) if "calculation_basis" in final_report.columns else 0
-        estimated_rows = int((final_report["calculation_basis"] == "estimated").sum()) if "calculation_basis" in final_report.columns else 0
-        official_factor_rows = int((final_report["factor_quality"] == "official").sum()) if "factor_quality" in final_report.columns else 0
 
     data_quality = {
         "total_rows": total_rows,
         "successful_rows": successful_rows,
-        "errored_rows": errored_rows,
+        "errored_rows": len(errors),
         "coverage_percent": coverage_percent,
-        "mapped_category_rows": mapped_rows,
-        "inferred_category_rows": inferred_rows,
-        "exact_factor_rows": exact_factor_rows,
-        "estimated_rows": estimated_rows,
-        "official_factor_rows": official_factor_rows,
-        "valid_rows_percent": round((successful_rows / total_rows) * 100, 2) if total_rows > 0 else 0.0,
-        "invalid_rows_percent": round((errored_rows / total_rows) * 100, 2) if total_rows > 0 else 0.0
     }
-
-    confidence = calculate_confidence_score(final_report, data_quality)
 
     return {
         "report": final_report,
@@ -1196,202 +1122,239 @@ def calculate_emissions_batch_safe(activity_list):
         "total_tCO2e": total_t,
         "errors": errors,
         "data_quality": data_quality,
-        "unmapped_categories": unmapped_summary,
-        "confidence": confidence
+        "mapping_log": mapping_log
     }
 
 
 # =========================
-# SUMMARIES
+# FACTOR AUDIT LOG
 # =========================
-def summarize_report_by_scope_and_category(report_df):
-    if report_df.empty:
-        return pd.DataFrame(columns=["scope", "category", "emissions_kgCO2e", "emissions_tCO2e"])
-
-    return (
-        report_df
-        .groupby(["scope", "category"], as_index=False)[["emissions_kgCO2e", "emissions_tCO2e"]]
-        .sum()
-        .sort_values(["scope", "category"])
-        .reset_index(drop=True)
-    )
-
-
-def summarize_report_by_scope(report_df):
-    if report_df.empty:
-        return pd.DataFrame(columns=["scope", "emissions_kgCO2e", "emissions_tCO2e", "percent_of_total"])
-
-    summary = (
-        report_df
-        .groupby("scope", as_index=False)[["emissions_kgCO2e", "emissions_tCO2e"]]
-        .sum()
-        .sort_values("emissions_kgCO2e", ascending=False)
-        .reset_index(drop=True)
-    )
-
-    total_kg = float(summary["emissions_kgCO2e"].sum()) if not summary.empty else 0.0
-    summary["percent_of_total"] = summary["emissions_kgCO2e"].apply(
-        lambda x: round((float(x) / total_kg) * 100, 2) if total_kg > 0 else 0.0
-    )
-    return summary
-
-
-def summarize_top_categories(report_df, top_n=5):
-    if report_df.empty:
-        return []
-
-    df = (
-        report_df
-        .groupby("category", as_index=False)[["emissions_kgCO2e", "emissions_tCO2e"]]
-        .sum()
-        .sort_values("emissions_kgCO2e", ascending=False)
-        .head(top_n)
-        .reset_index(drop=True)
-    )
-
-    return df.to_dict(orient="records")
-
-
-def build_factor_transparency(report_df):
-    """Enhanced factor transparency with DEFRA references."""
-    if report_df.empty:
-        return []
-
-    cols = [
-        "category",
-        "scope",
-        "item_name",
-        "factor_name",
-        "emission_factor_kgCO2e_per_unit",
-        "normalized_unit",
-        "factor_year",
-        "data_source",
-        "defra_reference",
-        "factor_quality",
-        "calculation_basis"
-    ]
-
-    available_cols = [c for c in cols if c in report_df.columns]
-    factor_df = report_df[available_cols].drop_duplicates().reset_index(drop=True)
-
-    factor_df = factor_df.sort_values(
-        by=[c for c in ["category", "item_name"] if c in factor_df.columns]
-    ).reset_index(drop=True)
-
-    return factor_df.to_dict(orient="records")
-
-
-def build_analytics(report_df):
-    analytics = {}
-
-    if report_df.empty:
-        analytics["average_emissions_per_row_kgco2e"] = 0.0
-        return analytics
-
-    analytics["average_emissions_per_row_kgco2e"] = round(float(report_df["emissions_kgCO2e"].mean()), 4)
-
-    category_df = (
-        report_df
-        .groupby("category", as_index=False)[["emissions_kgCO2e", "emissions_tCO2e"]]
-        .sum()
-        .sort_values("emissions_kgCO2e", ascending=False)
-        .reset_index(drop=True)
-    )
-    if not category_df.empty:
-        analytics["top_category_by_kgco2e"] = category_df.iloc[0].to_dict()
-        analytics["top_categories_by_kgco2e"] = category_df.head(5).to_dict(orient="records")
-
-    if "site_name" in report_df.columns:
-        site_df = (
-            report_df.assign(site_name=report_df["site_name"].fillna("Unspecified site"))
-            .groupby("site_name", as_index=False)[["emissions_kgCO2e", "emissions_tCO2e"]]
-            .sum()
-            .sort_values("emissions_kgCO2e", ascending=False)
-            .reset_index(drop=True)
-        )
-        if not site_df.empty:
-            analytics["top_site_by_kgco2e"] = site_df.iloc[0].to_dict()
-            analytics["top_sites_by_kgco2e"] = site_df.head(5).to_dict(orient="records")
-
-    if "scope" in report_df.columns:
-        scope_df = (
-            report_df
-            .groupby("scope", as_index=False)[["emissions_kgCO2e", "emissions_tCO2e"]]
-            .sum()
-            .sort_values("emissions_kgCO2e", ascending=False)
-            .reset_index(drop=True)
-        )
-        if not scope_df.empty:
-            analytics["top_scope_by_kgco2e"] = scope_df.iloc[0].to_dict()
-
-    return analytics
-
-
-def build_factor_log(report_df):
-    """NEW: Detailed log showing exactly which DEFRA factors were applied."""
-    if report_df.empty:
-        return []
+class FactorAuditLog:
+    """Generate detailed factor audit trails."""
     
-    cols_to_show = [
-        "row_index",
-        "item_name",
-        "input_amount",
-        "input_unit",
-        "normalized_unit",
-        "emission_factor_kgCO2e_per_unit",
-        "emissions_kgCO2e",
-        "defra_reference",
-        "factor_quality",
-        "category"
-    ]
+    @staticmethod
+    def generate_fleet_audit(
+        batch_result: Dict, 
+        defra_year: int = DEFAULT_FACTOR_YEAR
+    ) -> Dict[str, Any]:
+        """Generate audit log for fleet-specific calculations."""
+        report_df = batch_result["report"]
+        mapping_log = batch_result["mapping_log"]
+        
+        fleet_summary = {}
+        
+        for row_idx, entry in mapping_log.items():
+            item_name = entry["mapped_to"]
+            category = entry["category"]
+            emissions = entry["emissions_kgCO2e"]
+            
+            if item_name not in fleet_summary:
+                fleet_summary[item_name] = {
+                    "category": category,
+                    "total_emissions_kgCO2e": 0,
+                    "total_emissions_tCO2e": 0,
+                    "defra_factor": None,
+                    "defra_year": defra_year,
+                    "count": 0,
+                    "unit": None
+                }
+            
+            fleet_summary[item_name]["total_emissions_kgCO2e"] += emissions
+            fleet_summary[item_name]["total_emissions_tCO2e"] = fleet_summary[item_name]["total_emissions_kgCO2e"] / 1000
+            fleet_summary[item_name]["count"] += 1
+        
+        # Populate factors from report
+        for idx, row in report_df.iterrows():
+            item_name = row["item_name"]
+            if item_name in fleet_summary:
+                fleet_summary[item_name]["defra_factor"] = float(row["emission_factor_kgCO2e_per_unit"])
+                fleet_summary[item_name]["unit"] = row["normalized_unit"]
+        
+        return {
+            "audit_timestamp": datetime.now().isoformat(),
+            "defra_year": defra_year,
+            "total_fleet_emissions_kgCO2e": batch_result["total_kgCO2e"],
+            "total_fleet_emissions_tCO2e": batch_result["total_tCO2e"],
+            "fleet_breakdown": fleet_summary,
+            "coverage": batch_result["data_quality"]["coverage_percent"],
+            "errors": batch_result["data_quality"]["errored_rows"]
+        }
     
-    available = [c for c in cols_to_show if c in report_df.columns]
-    factor_log = report_df[available].copy()
-    
-    return factor_log.to_dict(orient="records")
+    @staticmethod
+    def generate_factor_transparency_report(
+        batch_result: Dict
+    ) -> Dict[str, Any]:
+        """Generate factor transparency report showing exact DEFRA mappings."""
+        report_df = batch_result["report"]
+        
+        transparency = {
+            "report_generated": datetime.now().isoformat(),
+            "total_calculations": len(report_df),
+            "factors_used": []
+        }
+        
+        for idx, row in report_df.iterrows():
+            transparency["factors_used"].append({
+                "input_item": row["item_name"],
+                "category": row["category"],
+                "defra_factor_kgCO2e_per_unit": float(row["emission_factor_kgCO2e_per_unit"]),
+                "defra_year": int(row["factor_year"]),
+                "defra_source": row["defra_reference"],
+                "unit": row["normalized_unit"],
+                "scope": row["scope"],
+                "calculation_basis": row["calculation_basis"]
+            })
+        
+        return transparency
 
 
 # =========================
-# RESPONSE BUILDERS
+# LEAD GENERATION FORMATTER
 # =========================
-def build_final_response(batch_result):
+class LeadGenFormatter:
+    """Format results for lead generation systems (Google Sheets, CRM, etc)."""
+    
+    @staticmethod
+    def format_for_google_sheets(
+        batch_result: Dict,
+        company_name: str,
+        reporting_period: str,
+        contact_email: str = None
+    ) -> Dict[str, Any]:
+        """Format data for Google Sheets integration."""
+        
+        return {
+            "lead_data": {
+                "company_name": company_name,
+                "reporting_period": reporting_period,
+                "contact_email": contact_email,
+                "total_co2e_tonnes": round(batch_result["total_tCO2e"], 2),
+                "total_co2e_kgCO2e": round(batch_result["total_kgCO2e"], 2),
+                "data_quality_score": batch_result["data_quality"]["coverage_percent"],
+                "rows_processed": batch_result["data_quality"]["successful_rows"],
+                "rows_total": batch_result["data_quality"]["total_rows"],
+            },
+            "breakdown_by_scope": LeadGenFormatter._calculate_scope_breakdown(batch_result["report"]),
+            "breakdown_by_category": LeadGenFormatter._calculate_category_breakdown(batch_result["report"]),
+            "generated_at": datetime.now().isoformat(),
+            "is_valid_for_reporting": batch_result["data_quality"]["coverage_percent"] > 70
+        }
+    
+    @staticmethod
+    def _calculate_scope_breakdown(report_df: pd.DataFrame) -> Dict[str, float]:
+        """Calculate emissions by Scope."""
+        if report_df.empty:
+            return {}
+        
+        breakdown = {}
+        for scope in ["Scope 1", "Scope 2", "Scope 3"]:
+            scope_data = report_df[report_df["scope"] == scope]
+            if not scope_data.empty:
+                breakdown[scope] = round(float(scope_data["emissions_tCO2e"].sum()), 2)
+        
+        return breakdown
+    
+    @staticmethod
+    def _calculate_category_breakdown(report_df: pd.DataFrame) -> Dict[str, float]:
+        """Calculate emissions by category."""
+        if report_df.empty:
+            return {}
+        
+        breakdown = {}
+        for category in report_df["category"].unique():
+            cat_data = report_df[report_df["category"] == category]
+            breakdown[category] = round(float(cat_data["emissions_tCO2e"].sum()), 2)
+        
+        return breakdown
+    
+    @staticmethod
+    def format_for_human_report(
+        batch_result: Dict,
+        company_name: str,
+        reporting_period: str
+    ) -> str:
+        """Generate human-readable report."""
+        
+        report = f"""
+╔════════════════════════════════════════════════════════════╗
+║          CARBON EMISSIONS REPORT                           ║
+║          {datetime.now().strftime('%Y-%m-%d')}                          ║
+╚════════════════════════════════════════════════════════════╝
+
+COMPANY: {company_name}
+REPORTING PERIOD: {reporting_period}
+STATUS: {"✓ VALID" if batch_result['data_quality']['coverage_percent'] > 70 else "⚠ INCOMPLETE"}
+
+────────────────────────────────────────────────────────────
+TOTAL EMISSIONS:
+────────────────────────────────────────────────────────────
+Total: {batch_result['total_tCO2e']:.2f} tCO2e ({batch_result['total_kgCO2e']:.2f} kgCO2e)
+
+────────────────────────────────────────────────────────────
+BREAKDOWN BY SCOPE:
+────────────────────────────────────────────────────────────
+"""
+        
+        scope_breakdown = LeadGenFormatter._calculate_scope_breakdown(batch_result["report"])
+        for scope, value in scope_breakdown.items():
+            report += f"{scope}: {value:.2f} tCO2e\n"
+        
+        report += "\n────────────────────────────────────────────────────────────\n"
+        report += "BREAKDOWN BY CATEGORY:\n"
+        report += "────────────────────────────────────────────────────────────\n"
+        
+        cat_breakdown = LeadGenFormatter._calculate_category_breakdown(batch_result["report"])
+        for category, value in cat_breakdown.items():
+            report += f"{category}: {value:.2f} tCO2e\n"
+        
+        report += f"\n────────────────────────────────────────────────────────────\n"
+        report += f"DATA QUALITY:\n"
+        report += "────────────────────────────────────────────────────────────\n"
+        report += f"Rows Processed: {batch_result['data_quality']['successful_rows']} / {batch_result['data_quality']['total_rows']}\n"
+        report += f"Coverage: {batch_result['data_quality']['coverage_percent']:.1f}%\n"
+        report += f"Errors: {batch_result['data_quality']['errored_rows']}\n"
+        
+        if batch_result["errors"]:
+            report += "\n────────────────────────────────────────────────────────────\n"
+            report += "ERRORS ENCOUNTERED:\n"
+            report += "────────────────────────────────────────────────────────────\n"
+            for err in batch_result["errors"][:5]:
+                report += f"Row {err['row_index_original']}: {err['error']}\n"
+        
+        return report
+
+
+# =========================
+# FINAL RESPONSE BUILDER
+# =========================
+def build_final_response(batch_result, company_name: str = None, reporting_period: str = None):
+    """Build comprehensive response with all metadata."""
     report_df = batch_result["report"]
-
-    summary_scope_category = summarize_report_by_scope_and_category(report_df)
-    summary_scope = summarize_report_by_scope(report_df)
-    factor_transparency = build_factor_transparency(report_df)
-    factor_log = build_factor_log(report_df)
-    analytics = build_analytics(report_df)
-
-    error_groups = group_errors(batch_result["errors"])
-    error_summary = build_error_summary(batch_result["errors"])
-    errors_preview = build_errors_preview(batch_result["errors"], max_items=10)
-
-    top_categories = summarize_top_categories(report_df, top_n=5)
+    line_items = report_df.to_dict(orient="records") if not report_df.empty else []
 
     return {
-        "line_items": report_df.to_dict(orient="records"),
-        "summary_by_scope_category": summary_scope_category.to_dict(orient="records"),
-        "summary_by_scope": summary_scope.to_dict(orient="records"),
+        "metadata": {
+            "generated_at": datetime.now().isoformat(),
+            "defra_year": DEFAULT_FACTOR_YEAR,
+            "company_name": company_name,
+            "reporting_period": reporting_period,
+        },
         "totals": {
             "total_kgCO2e": batch_result["total_kgCO2e"],
-            "total_tCO2e": batch_result["total_tCO2e"]
+            "total_tCO2e": batch_result["total_tCO2e"],
         },
-        "analytics": analytics,
-        "top_categories_by_kgco2e": top_categories,
-        "confidence_score": batch_result.get("confidence", {}),
-        "data_quality": batch_result.get("data_quality", {}),
+        "line_items": line_items,
+        "data_quality": batch_result["data_quality"],
         "errors": batch_result["errors"],
-        "errors_preview": errors_preview,
-        "error_summary": error_summary,
-        "issue_groups": error_groups,
-        "unmapped_categories": batch_result.get("unmapped_categories", []),
-        "factor_transparency": factor_transparency,
-        "factor_log": factor_log,
+        "factor_reference_years_used": list(set([item.get("factor_year") for item in line_items])) if line_items else [],
+        "fleet_audit": FactorAuditLog.generate_fleet_audit(batch_result),
+        "factor_transparency": FactorAuditLog.generate_factor_transparency_report(batch_result),
+        "lead_gen_data": LeadGenFormatter.format_for_google_sheets(batch_result, company_name, reporting_period) if company_name else None,
     }
 
 
 def make_json_safe(obj):
+    """Convert numpy/pandas types to JSON-safe types."""
     if isinstance(obj, dict):
         return {k: make_json_safe(v) for k, v in obj.items()}
     if isinstance(obj, list):
@@ -1407,50 +1370,110 @@ def make_json_safe(obj):
     return obj
 
 
-def run_emissions_engine(request_json):
-    """Main entry point."""
+# =========================
+# MAIN ENGINE API
+# =========================
+def run_emissions_engine(request_json: Dict) -> Dict[str, Any]:
+    """Main entry point for carbon calculation."""
     activities = request_json.get("activities", [])
+    company_name = request_json.get("company_name")
+    reporting_period = request_json.get("reporting_period")
+    
     batch_result = calculate_emissions_batch_safe(activities)
-    final_response = build_final_response(batch_result)
+    final_response = build_final_response(batch_result, company_name, reporting_period)
     return make_json_safe(final_response)
 
 
-# =========================
-# CSV TEMPLATE GENERATOR
-# =========================
-def generate_upload_template() -> str:
-    """Generate a branded CSV template for clients."""
-    template = """category,item_name,amount,unit,vehicle_type,notes,reporting_period,site_name
-Electricity,UK Grid Supply,1200,kWh,,January 2024 consumption,2024-01-31,London HQ
-Business Travel,Fleet Vehicle,150,vehicle_km,Electric car (BEV),VW ID3,2024-01-31,London HQ
-Business Travel,HGV Transport,500,vehicle_km,HGV (44 tonnes),Mercedes Actros,2024-01-31,London HQ
-Business Travel,Hybrid Fleet,200,vehicle_km,Hybrid (HEV/PHEV),BMW 330e,2024-01-31,London HQ
-Waste,General,2.5,tonnes,,Monthly disposal,2024-01-31,London HQ
-Water,UK Supply,45,cubic metres,,Monthly usage,2024-01-31,London HQ
-"""
-    return template
-
-
-def validate_upload_compatibility(df: pd.DataFrame) -> Dict[str, Any]:
-    """NEW: Validation report for uploaded data BEFORE processing."""
-    df_test, col_mapping = detect_and_remap_columns(df)
+def validate_and_preview_csv(csv_path: str) -> Dict[str, Any]:
+    """Validate CSV before processing."""
+    df = pd.read_csv(csv_path)
+    validation = CSVValidator.validate_csv(df)
+    mapping_suggestions = CSVValidator.suggest_column_mapping(df)
     
-    validation_report = {
-        "columns_detected": list(df.columns),
-        "columns_remapped": col_mapping,
-        "required_columns_present": all(col in df_test.columns for col in ["amount", "unit", "category"]),
-        "total_rows": len(df),
-        "sample_preview": df_test.head(3).to_dict(orient="records"),
-        "potential_issues": []
+    return {
+        "validation": validation,
+        "suggested_mapping": mapping_suggestions,
+        "preview_rows": df.head(3).to_dict(orient="records")
+    }
+
+
+def generate_csv_template(company_name: str = "Your Company") -> bytes:
+    """Generate and return CSV template."""
+    return CSVTemplateGenerator.export_template_to_csv(company_name)
+
+
+def get_factor_audit_log(year: int = DEFAULT_FACTOR_YEAR) -> Dict[str, Any]:
+    """Get complete audit log of DEFRA factors."""
+    return DEFRA_LIBRARY.list_factors_by_year(year)
+
+
+def get_supported_years() -> List[int]:
+    """Get supported DEFRA years."""
+    return DEFRA_LIBRARY.list_supported_years()
+
+
+# =========================
+# EXAMPLE USAGE
+# =========================
+if __name__ == "__main__":
+    # Example request
+    request = {
+        "company_name": "Acme Corporation",
+        "reporting_period": "April 2024",
+        "activities": [
+            {
+                "category": "Electricity",
+                "item_name": "Office",
+                "amount": 5200,
+                "unit": "kWh",
+                "row_index_original": 1
+            },
+            {
+                "category": "Electricity",
+                "item_name": "Warehouse",
+                "amount": 3100,
+                "unit": "kWh",
+                "row_index_original": 2
+            },
+            {
+                "category": "Fuel",
+                "fuel": "Natural gas",
+                "amount": 850,
+                "unit": "kWh (Gross CV)",
+                "row_index_original": 3
+            },
+            {
+                "category": "Business Travel",
+                "item_name": "VW ID3",
+                "amount": 1200,
+                "unit": "vehicle_km",
+                "row_index_original": 4
+            },
+            {
+                "category": "Business Travel",
+                "item_name": "BMW 330e",
+                "amount": 950,
+                "unit": "vehicle_km",
+                "row_index_original": 5
+            },
+            {
+                "category": "Business Travel",
+                "item_name": "Mercedes Actros",
+                "amount": 450,
+                "unit": "vehicle_km",
+                "row_index_original": 6
+            }
+        ]
     }
     
-    if "amount" not in df_test.columns:
-        validation_report["potential_issues"].append("No 'amount' column detected. Please provide a numeric energy/quantity column.")
+    response = run_emissions_engine(request)
+    print(json.dumps(response, indent=2))
     
-    if "unit" not in df_test.columns:
-        validation_report["potential_issues"].append("No 'unit' column detected. Please specify units (kWh, vehicle_km, tonnes, etc.).")
-    
-    if "category" not in df_test.columns:
-        validation_report["potential_issues"].append("No 'category' column detected. Please specify activity type (Electricity, Business Travel, etc.).")
-    
-    return validation_report
+    # Generate human-readable report
+    batch_result = calculate_emissions_batch_safe(request["activities"])
+    report = LeadGenFormatter.format_for_human_report(
+        batch_result,
+        request.get("company_name"),
+        request.get("reporting_period")
+    )
+    print("\n" + report)
