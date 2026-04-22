@@ -753,7 +753,7 @@ def generate_template_endpoint(company_name: str = Query("Your Company")):
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {str(e)}")
 
 
-@app.get("/api/detect-columns")
+@app.post("/api/detect-columns")
 async def detect_columns_endpoint(
     file: Annotated[UploadFile, File(description="CSV or Excel file for column detection")]
 ):
@@ -887,7 +887,7 @@ async def upload_calculate(
     email: Annotated[str, Form(...)],
     company_name: Annotated[str, Form(...)],
     phone_number: Annotated[str, Form(...)],
-    reporting_period: Annotated[str, Form(default="")],
+    reporting_period: Annotated[str, Form(...)] = "",
 ):
     """
     Upload CSV/Excel and get JSON response.
@@ -964,7 +964,7 @@ async def upload_calculate_download(
     email: Annotated[str, Form(...)],
     company_name: Annotated[str, Form(...)],
     phone_number: Annotated[str, Form(...)],
-    reporting_period: Annotated[str, Form(default="")],
+    reporting_period: Annotated[str, Form(...)] = "",
 ):
     """
     Upload CSV/Excel and download Excel report.
