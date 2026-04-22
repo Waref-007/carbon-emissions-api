@@ -1,6 +1,6 @@
 # Carbon Emissions API
 
-FastAPI backend for deterministic carbon emissions calculations using DEFRA 2025 factors.
+FastAPI backend for deterministic carbon emissions calculations using DEFRA 23, 24 and 2025 factors.
 
 ## Files
 - `main.py` -> FastAPI app
