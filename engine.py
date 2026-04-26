@@ -1,21 +1,22 @@
 """
 engine.py - Production-oriented carbon emissions calculation engine
 
-Version: 3.0.0
+Version: 3.1.0
 
-Designed for:
-- Canonical activity-row inputs: category, amount, unit, item_name/fuel/country/etc.
-- Semi-structured workbook-like records that have been flattened into row dictionaries.
-- DEFRA / UK Government factor-year handling for 2023, 2024, 2025.
-- Strong audit trail: calculation formula, input hash, factor id/source/year/match type.
-- Report-ready API output: line items, totals, summaries, insights, data quality, errors.
-- Conservative double-counting controls for fleet fuel, business mileage, and EV charging.
+What this version fixes/improves:
+- Handles canonical JSON/CSV activity rows: category, amount, unit, item_name/fuel/country/etc.
+- Handles normal Excel sheets read with header=None by detecting a real header row and rebuilding tabular records.
+- Handles semi-structured workbook-like rows through block parsing.
+- Prevents the dangerous false-positive case: 0 emissions + 100/100 confidence.
+- Adds strong audit fields: factor id, source, match type, calculation formula, input hash, engine version.
+- Adds better data-quality scoring, issue grouping, parser diagnostics, fallback warnings, and report-ready output.
+- Supports custom factor_rows injection so official DEFRA / UK Government flat-file factors can override built-ins.
 
 Important production note:
-This engine includes starter built-in factor rows to keep your Render app working.
-For true external audit/reporting use, replace or supplement BUILTIN_FACTOR_ROWS with
-official UK Government conversion-factor flat-file rows using a factor_loader.py module.
-The engine is deliberately structured so that replacement is straightforward.
+This file includes starter built-in factor rows to keep the app working. For external audit-grade reporting,
+load official UK Government / DEFRA conversion-factor rows through request_json["factor_rows"] or a future
+factor_loader.py module. Rows marked starter_placeholder or official_pending_traceability must be reviewed before
+client/audit release.
 """
 
 from __future__ import annotations
@@ -34,7 +35,7 @@ import pandas as pd
 # ============================================================
 # VERSIONING / GLOBALS
 # ============================================================
-ENGINE_VERSION = "3.0.0"
+ENGINE_VERSION = "3.1.0"
 DEFAULT_FACTOR_YEAR = 2025
 SUPPORTED_FACTOR_YEARS = {2023, 2024, 2025}
 DEFAULT_COUNTRY = "Electricity: UK"
@@ -78,9 +79,7 @@ METADATA_FIELDS = [
 # ============================================================
 # BUILT-IN FACTOR LIBRARY
 # ============================================================
-# Values preserve your known factors and add a few starter operational factors.
-# Every row is explicit about quality. Do not call starter rows audit-final.
-
+# Keep these built-ins to avoid app failure, but treat placeholder rows as non-audit-final.
 BUILTIN_FACTOR_ROWS: List[Dict[str, Any]] = [
     # Natural gas
     {
@@ -152,7 +151,7 @@ BUILTIN_FACTOR_ROWS: List[Dict[str, Any]] = [
         "factor_description": "Natural gas combustion factor, tonnes.",
     },
 
-    # Electricity. 2023/2024 are placeholders until official rows are loaded.
+    # Electricity. 2023/2024 starter rows should be replaced with official rows.
     {
         "factor_id": "uk-2023-electricity-uk-kwh-placeholder",
         "factor_year": 2023,
@@ -241,7 +240,7 @@ BUILTIN_FACTOR_ROWS: List[Dict[str, Any]] = [
         "factor_description": "Water supply factor.",
     },
 
-    # Liquid fuels - starter operational paths
+    # Liquid fuels
     {
         "factor_id": "uk-2025-liquid-fuel-diesel-litres-starter",
         "factor_year": 2025,
@@ -275,23 +274,6 @@ BUILTIN_FACTOR_ROWS: List[Dict[str, Any]] = [
         "source_sheet": "liquid_fuels",
         "source_row": None,
         "factor_description": "Petrol litres direct combustion starter factor.",
-    },
-    {
-        "factor_id": "uk-2025-adblue-litres-disclosure-only",
-        "factor_year": 2025,
-        "category": "liquid fuel",
-        "display_category": "Liquid Fuel",
-        "scope": "Scope 3",
-        "activity_group": "Vehicle consumables",
-        "item_name": "AdBlue",
-        "unit": "litres",
-        "kgCO2e_per_unit": 0.0,
-        "factor_quality": "disclosure_only_placeholder",
-        "source_name": "No calculation factor configured - disclosure only until approved",
-        "source_file": "built_in_engine_table",
-        "source_sheet": "vehicle_consumables",
-        "source_row": None,
-        "factor_description": "AdBlue recorded for transparency but not emissions-calculated by default.",
     },
 
     # Business travel and mileage - starter only
@@ -455,8 +437,6 @@ BUILTIN_FACTOR_ROWS: List[Dict[str, Any]] = [
 
 def _build_builtin_factor_table() -> pd.DataFrame:
     rows = list(BUILTIN_FACTOR_ROWS)
-
-    # Add kg waste equivalents from tonne rows.
     for row in list(rows):
         if row.get("category") == "waste" and row.get("unit") == "tonnes":
             kg = dict(row)
@@ -465,7 +445,6 @@ def _build_builtin_factor_table() -> pd.DataFrame:
             kg["kgCO2e_per_unit"] = float(kg["kgCO2e_per_unit"]) / 1000.0
             kg["factor_description"] = f"{kg.get('factor_description', '').strip()} Converted to kg basis."
             rows.append(kg)
-
     df = pd.DataFrame(rows)
     df["factor_year"] = pd.to_numeric(df["factor_year"], errors="coerce").fillna(DEFAULT_FACTOR_YEAR).astype(int)
     df["kgCO2e_per_unit"] = pd.to_numeric(df["kgCO2e_per_unit"], errors="coerce").fillna(0.0)
@@ -629,6 +608,64 @@ UNIT_ALIASES = {
     "passenger kilometres": "passenger_km",
 }
 
+COLUMN_ALIASES = {
+    "category": "category",
+    "activity": "category",
+    "activity category": "category",
+    "emissions category": "category",
+    "type": "category",
+    "scope category": "category",
+    "amount": "amount",
+    "quantity": "amount",
+    "value": "amount",
+    "usage": "amount",
+    "consumption": "amount",
+    "total": "amount",
+    "total usage": "amount",
+    "kwh": "amount",
+    "litres": "amount",
+    "miles": "amount",
+    "unit": "unit",
+    "units": "unit",
+    "uom": "unit",
+    "measure": "unit",
+    "item": "item_name",
+    "item name": "item_name",
+    "fuel": "fuel",
+    "fuel type": "fuel",
+    "country": "country",
+    "site": "site_name",
+    "site name": "site_name",
+    "location": "site_name",
+    "client": "client_name",
+    "client name": "client_name",
+    "company": "company_name",
+    "company name": "company_name",
+    "period": "reporting_period",
+    "reporting period": "reporting_period",
+    "year": "reporting_year",
+    "reporting year": "reporting_year",
+    "date": "reporting_period",
+    "start date": "period_start",
+    "end date": "period_end",
+    "period start": "period_start",
+    "period end": "period_end",
+    "supplier": "supplier",
+    "invoice": "invoice_reference",
+    "invoice reference": "invoice_reference",
+    "meter": "meter_id",
+    "meter id": "meter_id",
+    "vehicle": "raw_vehicle",
+    "vehicle registration": "vehicle_registration",
+    "registration": "vehicle_registration",
+    "driver": "driver_name",
+    "driver name": "driver_name",
+    "department": "department",
+    "cost centre": "cost_centre",
+    "cost center": "cost_centre",
+    "notes": "notes",
+}
+
 VEHICLE_CLASS_RULES = [
     ("car_ev", [r"\belectric\b", r"\bev\b", r"\bid\.?3\b", r"\bid3\b", r"\beqa\b", r"\btesla\b", r"\bleaf\b"]),
     ("car_plugin_hybrid", [r"plug[\s\-]?in hybrid", r"\bphev\b", r"\b330e\b", r"\bgte\b"]),
@@ -668,21 +705,21 @@ def normalise_key(value: Any) -> str:
     if text is None:
         return ""
     text = text.lower().strip()
+    text = re.sub(r"[_\-]+", " ", text)
     text = re.sub(r"\s+", " ", text)
     return text
 
 
 def strip_money_and_commas(value: Any) -> Any:
     if isinstance(value, str):
-        return (
-            value.replace(",", "")
-            .replace("£", "")
-            .replace("$", "")
-            .replace("€", "")
-            .replace("kgCO2e", "")
-            .replace("kg CO2e", "")
-            .strip()
-        )
+        cleaned = value.strip()
+        cleaned = cleaned.replace(",", "")
+        cleaned = re.sub(r"[£$€]", "", cleaned)
+        cleaned = re.sub(r"(?i)kg\s*co2e|t\s*co2e|co2e", "", cleaned)
+        cleaned = cleaned.strip()
+        if cleaned.startswith("(") and cleaned.endswith(")"):
+            cleaned = "-" + cleaned[1:-1]
+        return cleaned
     return value
 
 
@@ -773,13 +810,9 @@ def parse_period_bounds(value: Any) -> Tuple[Optional[pd.Timestamp], Optional[pd
     if looks_like_date(text):
         dt = parse_date(text)
         return dt, dt
-
     parts = re.split(r"\s*(?:-|to|–|—)\s*", text, flags=re.IGNORECASE)
     if len(parts) == 2:
-        start = parse_date(parts[0])
-        end = parse_date(parts[1])
-        return start, end
-
+        return parse_date(parts[0]), parse_date(parts[1])
     return None, None
 
 
@@ -826,6 +859,13 @@ def normalize_unit(value: Any) -> Optional[str]:
     return UNIT_ALIASES.get(key, safe_text(value))
 
 
+def normalize_column_name(value: Any) -> str:
+    key = normalise_key(value)
+    if not key:
+        return ""
+    return COLUMN_ALIASES.get(key, re.sub(r"[^a-z0-9]+", "_", key).strip("_"))
+
+
 def classify_vehicle_class(description: Any) -> Optional[str]:
     text = safe_text(description)
     if not text:
@@ -846,13 +886,10 @@ def get_factor_year(activity: Dict[str, Any]) -> int:
     for key in ["factor_year", "year", "reporting_year"]:
         if safe_text(activity.get(key)) is not None:
             return validate_year(activity.get(key))
-
-    # Try period end/start/reporting period.
     for key in ["period_end", "period_start", "reporting_period"]:
         dt = parse_date(activity.get(key))
         if dt is not None:
             return int(dt.year)
-
     return DEFAULT_FACTOR_YEAR
 
 
@@ -860,11 +897,9 @@ def normalize_amount_and_unit(amount: float, unit: str, category: str) -> Tuple[
     normalized_unit = normalize_unit(unit)
     if normalized_unit is None:
         raise ValueError("unit is required.")
-
     if normalized_unit == "miles":
         converted = convert_miles_to_km(amount)
         return converted, "vehicle_km", f"Converted miles to vehicle_km using 1 mile = 1.609344 km. Original amount: {amount} miles."
-
     return amount, normalized_unit, None
 
 
@@ -894,11 +929,11 @@ def normalise_factor_table(factor_rows: Optional[List[Dict[str, Any]]] = None) -
     if custom.empty:
         return FACTOR_TABLE.copy()
 
-    # Accept common alternative names.
     rename_map = {
         "kg CO2e": "kgCO2e_per_unit",
         "kg_co2e": "kgCO2e_per_unit",
         "kg_co2e_per_unit": "kgCO2e_per_unit",
+        "kgCO2e": "kgCO2e_per_unit",
         "year": "factor_year",
         "source": "source_name",
         "data_source": "source_name",
@@ -908,7 +943,7 @@ def normalise_factor_table(factor_rows: Optional[List[Dict[str, Any]]] = None) -
     for col in REQUIRED_FACTOR_COLUMNS:
         if col not in custom.columns:
             if col == "factor_id":
-                custom[col] = [f"custom-factor-{i+1}" for i in range(len(custom))]
+                custom[col] = [f"custom-factor-{i + 1}" for i in range(len(custom))]
             elif col == "display_category":
                 custom[col] = custom.get("category", "Unknown")
             elif col == "scope":
@@ -926,7 +961,6 @@ def normalise_factor_table(factor_rows: Optional[List[Dict[str, Any]]] = None) -
     custom["kgCO2e_per_unit"] = pd.to_numeric(custom["kgCO2e_per_unit"], errors="coerce")
     custom = custom[custom["kgCO2e_per_unit"].notna()].copy()
 
-    # Custom rows first so they override built-ins.
     combined = pd.concat([custom, FACTOR_TABLE.copy()], ignore_index=True)
     combined["_dedupe_key"] = (
         combined["factor_year"].astype(str).str.lower() + "|" +
@@ -949,22 +983,12 @@ def _candidate_years(year: int, factor_table: pd.DataFrame) -> List[int]:
     return years
 
 
-def match_factor(
-    category: str,
-    item_name: str,
-    unit: str,
-    factor_year: int,
-    factor_table: pd.DataFrame,
-    allow_year_fallback: bool = True,
-    allow_generic_fallback: bool = True,
-) -> Tuple[pd.Series, str, str]:
+def match_factor(category: str, item_name: str, unit: str, factor_year: int, factor_table: pd.DataFrame, allow_year_fallback: bool = True, allow_generic_fallback: bool = True) -> Tuple[pd.Series, str, str]:
     category_key = category.strip().lower()
     item_key = item_name.strip().lower()
     unit_key = unit.strip().lower()
-
     candidate_years = _candidate_years(factor_year, factor_table) if allow_year_fallback else [factor_year]
 
-    # exact item/unit/year first
     for year in candidate_years:
         subset = factor_table[
             (factor_table["factor_year"].astype(int) == int(year)) &
@@ -978,7 +1002,6 @@ def match_factor(
             return subset.iloc[0], "year_fallback", f"Requested factor year {factor_year}; used available year {year}."
 
     if allow_generic_fallback:
-        # generic same category/unit fallback
         for year in candidate_years:
             subset = factor_table[
                 (factor_table["factor_year"].astype(int) == int(year)) &
@@ -991,10 +1014,7 @@ def match_factor(
                     f"'{subset.iloc[0].get('item_name')}' for year {year}."
                 )
 
-    raise ValueError(
-        f"No matching factor found for category='{category}', item_name='{item_name}', "
-        f"unit='{unit}', factor_year={factor_year}."
-    )
+    raise ValueError(f"No matching factor found for category='{category}', item_name='{item_name}', unit='{unit}', factor_year={factor_year}.")
 
 
 # ============================================================
@@ -1011,7 +1031,6 @@ def infer_canonical_category(activity: Dict[str, Any]) -> Dict[str, Any]:
         ("raw_row_label", activity.get("raw_row_label")),
         ("notes", activity.get("notes")),
     ]
-
     for source, value in candidates:
         mapped = normalize_category(value)
         if mapped:
@@ -1021,13 +1040,7 @@ def infer_canonical_category(activity: Dict[str, Any]) -> Dict[str, Any]:
                 "mapping_source": source if source == "category" else "inferred",
                 "mapping_confidence": "high" if source == "category" else "medium",
             }
-
-    return {
-        "raw_category": raw_category,
-        "canonical_category": None,
-        "mapping_source": "unmapped",
-        "mapping_confidence": "low",
-    }
+    return {"raw_category": raw_category, "canonical_category": None, "mapping_source": "unmapped", "mapping_confidence": "low"}
 
 
 def infer_item_name(activity: Dict[str, Any], canonical_category: str) -> str:
@@ -1044,14 +1057,13 @@ def infer_item_name(activity: Dict[str, Any], canonical_category: str) -> str:
         activity.get("notes"),
         activity.get("category"),
     ]
-
     for value in candidates:
         item = normalize_item(value)
         if not item:
             continue
         if item.lower() in {"fuel", "liquid fuel", "business travel", "travel", "waste", "water", "electricity"}:
             continue
-        if canonical_category == "electricity" and item.lower().startswith("ev charging"):
+        if canonical_category == "electricity":
             return "Electricity: UK"
         return item
 
@@ -1080,15 +1092,70 @@ def infer_scope_override(activity: Dict[str, Any]) -> Optional[str]:
     return scope
 
 
+def enrich_tabular_activity(record: Dict[str, Any], row_index_original: int, opts: Dict[str, Any]) -> Dict[str, Any]:
+    activity = dict(record)
+    activity.setdefault("row_index_original", row_index_original)
+    activity.setdefault("source_file", opts.get("source_file"))
+    activity.setdefault("source_sheet", opts.get("source_sheet"))
+    activity.setdefault("source_workbook", opts.get("source_workbook"))
+    activity.setdefault("source_section", "tabular_activity_sheet")
+
+    # If amount came from a unit-named column, infer missing unit.
+    if is_blank(activity.get("unit")):
+        amount_source = safe_text(activity.get("_amount_source_column"))
+        if amount_source:
+            inferred_unit = normalize_unit(amount_source)
+            if inferred_unit:
+                activity["unit"] = inferred_unit
+
+    # Infer category from unit/source column when category missing.
+    if is_blank(activity.get("category")):
+        unit = normalize_unit(activity.get("unit"))
+        src_col = normalise_key(activity.get("_amount_source_column"))
+        if unit in {"kWh", "kWh (Gross CV)", "kWh (Net CV)"} or "electric" in src_col:
+            activity["category"] = "electricity"
+        elif unit == "litres" or "diesel" in src_col or "fuel" in src_col:
+            activity["category"] = "liquid fuel"
+        elif unit in {"cubic metres", "million litres"} and "water" in src_col:
+            activity["category"] = "water"
+        elif unit in {"miles", "vehicle_km", "passenger_km"}:
+            activity["category"] = "business travel"
+        elif unit in {"kg", "tonnes"} and "waste" in src_col:
+            activity["category"] = "waste"
+
+    category = normalize_category(activity.get("category"))
+    if category == "electricity":
+        activity.setdefault("country", opts.get("electricity_country", DEFAULT_COUNTRY))
+        activity.setdefault("item_name", opts.get("electricity_country", DEFAULT_COUNTRY))
+    if category == "fuel" and is_blank(activity.get("fuel")):
+        activity["fuel"] = "Natural gas"
+    if category == "liquid fuel" and is_blank(activity.get("fuel")) and is_blank(activity.get("item_name")):
+        activity["fuel"] = opts.get("fleet_fuel_type", "Diesel")
+        activity["item_name"] = opts.get("fleet_fuel_type", "Diesel")
+    if category == "water" and is_blank(activity.get("item_name")):
+        activity["item_name"] = "Water supply"
+
+    if is_blank(activity.get("reporting_year")):
+        for key in ["reporting_period", "period_end", "period_start"]:
+            dt = parse_date(activity.get(key))
+            if dt is not None:
+                activity["reporting_year"] = int(dt.year)
+                break
+
+    if safe_text(activity.get("raw_vehicle")) and is_blank(activity.get("vehicle_class")):
+        activity["vehicle_class"] = classify_vehicle_class(activity.get("raw_vehicle"))
+
+    return activity
+
+
 # ============================================================
-# WORKBOOK PARSER
+# TABULAR EXCEL DETECTION
 # ============================================================
 def records_to_dataframe(records: List[Dict[str, Any]]) -> pd.DataFrame:
     if not records:
         return pd.DataFrame()
     df = pd.DataFrame(records).reset_index(drop=True)
 
-    # If columns are col_1, col_2... keep order and make numeric columns.
     def col_num(c: Any) -> int:
         m = re.search(r"(\d+)$", str(c))
         return int(m.group(1)) if m else 999999
@@ -1101,13 +1168,19 @@ def records_to_dataframe(records: List[Dict[str, Any]]) -> pd.DataFrame:
 
 def preprocess_uploaded_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     df_clean = df.copy()
-    df_clean.columns = [str(c).strip().lower().replace("\n", " ").replace("\r", " ") for c in df_clean.columns]
-
+    df_clean.columns = [normalize_column_name(c) or str(c).strip().lower() for c in df_clean.columns]
     object_cols = df_clean.select_dtypes(include=["object"]).columns
     for col in object_cols:
         df_clean[col] = df_clean[col].apply(lambda x: x.strip() if isinstance(x, str) else x)
-
     df_clean = df_clean.replace(r"^\s*$", None, regex=True)
+
+    # Common amount alternatives.
+    if "amount" not in df_clean.columns:
+        for candidate in ["quantity", "usage", "consumption", "value", "total"]:
+            if candidate in df_clean.columns:
+                df_clean["amount"] = df_clean[candidate]
+                df_clean["_amount_source_column"] = candidate
+                break
 
     if "category" in df_clean.columns:
         df_clean["category"] = df_clean["category"].apply(lambda x: normalise_key(x) if isinstance(x, str) else x)
@@ -1117,15 +1190,91 @@ def preprocess_uploaded_dataframe(df: pd.DataFrame) -> pd.DataFrame:
         df_clean["item_name"] = df_clean["item_name"].apply(lambda x: normalize_item(x) if isinstance(x, str) else x)
     if "fuel" in df_clean.columns:
         df_clean["fuel"] = df_clean["fuel"].apply(lambda x: normalize_item(x) if isinstance(x, str) else x)
-
     return df_clean.where(pd.notnull(df_clean), None)
 
 
 def looks_like_canonical_activity_df(df: pd.DataFrame) -> bool:
-    cols = {str(c).lower() for c in df.columns}
-    return {"category", "amount", "unit"}.issubset(cols)
+    cols = {normalize_column_name(c) for c in df.columns}
+    return {"category", "amount", "unit"}.issubset(cols) or ({"amount", "unit"}.issubset(cols) and any(c in cols for c in ["item_name", "fuel", "country"]))
 
 
+def row_header_score(values: List[Any]) -> int:
+    score = 0
+    normalized = [normalize_column_name(v) for v in values if safe_text(v)]
+    keys = set(normalized)
+    for required in ["category", "amount", "unit"]:
+        if required in keys:
+            score += 3
+    for useful in ["item_name", "fuel", "site_name", "reporting_period", "reporting_year", "country", "supplier", "driver_name", "vehicle_registration"]:
+        if useful in keys:
+            score += 1
+    # Headers usually have text spread across several columns.
+    if len(keys) >= 4:
+        score += 2
+    return score
+
+
+def detect_header_row_in_raw_dataframe(df_raw: pd.DataFrame, max_scan_rows: int = 25) -> Optional[int]:
+    best_row = None
+    best_score = 0
+    for r in range(min(df_raw.shape[0], max_scan_rows)):
+        values = [df_raw.iat[r, c] for c in range(df_raw.shape[1])]
+        score = row_header_score(values)
+        if score > best_score:
+            best_score = score
+            best_row = r
+    return best_row if best_score >= 8 else None
+
+
+def parse_tabular_records_from_raw_dataframe(df_raw: pd.DataFrame, header_row: int, opts: Dict[str, Any]) -> Dict[str, Any]:
+    headers_raw = [df_raw.iat[header_row, c] for c in range(df_raw.shape[1])]
+    headers = []
+    seen: Dict[str, int] = {}
+    for idx, raw in enumerate(headers_raw):
+        name = normalize_column_name(raw)
+        if not name:
+            name = f"unnamed_col_{idx + 1}"
+        seen[name] = seen.get(name, 0) + 1
+        if seen[name] > 1:
+            name = f"{name}_{seen[name]}"
+        headers.append(name)
+
+    body = df_raw.iloc[header_row + 1:].copy().reset_index(drop=True)
+    body.columns = headers
+    body = body.dropna(how="all")
+    body = preprocess_uploaded_dataframe(body)
+
+    records: List[Dict[str, Any]] = []
+    warnings: List[str] = []
+
+    # If a realistic dataset has category/amount/unit, use it directly.
+    for i, rec in enumerate(body.to_dict(orient="records")):
+        if all(is_blank(v) for v in rec.values()):
+            continue
+        activity = enrich_tabular_activity(rec, row_index_original=header_row + i + 2, opts=opts)
+        records.append(activity)
+
+    if not records:
+        warnings.append("A header row was detected, but no non-empty activity records were found below it.")
+
+    return {
+        "activities": records,
+        "parser_diagnostics": {
+            "parser_used": "tabular_header_parser",
+            "header_row": header_row + 1,
+            "detected_columns": headers,
+            "input_shape": {"rows": int(df_raw.shape[0]), "cols": int(df_raw.shape[1])},
+            "warnings": warnings,
+            "extracted_activity_count": len(records),
+            "source_file": opts.get("source_file"),
+            "source_sheet": opts.get("source_sheet"),
+        },
+    }
+
+
+# ============================================================
+# SEMI-STRUCTURED WORKBOOK PARSER
+# ============================================================
 def find_matching_cells(df: pd.DataFrame, pattern: str) -> List[Tuple[int, int, str]]:
     matches = []
     regex = re.compile(pattern, flags=re.IGNORECASE)
@@ -1157,15 +1306,7 @@ def append_parser_warning(diag: Dict[str, Any], message: str) -> None:
         diag["warnings"].append(message)
 
 
-def build_normalized_activity(
-    category: str,
-    amount: Any,
-    unit: str,
-    row_index_original: int,
-    source_section: str,
-    reporting_period: Optional[str] = None,
-    **extra: Any,
-) -> Dict[str, Any]:
+def build_normalized_activity(category: str, amount: Any, unit: str, row_index_original: int, source_section: str, reporting_period: Optional[str] = None, **extra: Any) -> Dict[str, Any]:
     record = {
         "category": category,
         "amount": amount,
@@ -1180,37 +1321,26 @@ def build_normalized_activity(
 
 def parse_vehicle_registry(df_raw: pd.DataFrame, diag: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     registry: Dict[str, Dict[str, Any]] = {}
-
-    # Search rows for registration-like values rather than hardcoding one layout only.
     reg_pattern = re.compile(r"\b[A-Z]{2}\d{2}\s?[A-Z]{3}\b", flags=re.IGNORECASE)
-
     for r in range(df_raw.shape[0]):
         row_texts = [safe_text(df_raw.iat[r, c]) for c in range(df_raw.shape[1])]
         row_joined = " ".join([x for x in row_texts if x])
         regs = reg_pattern.findall(row_joined)
-        if not regs:
-            continue
-
         for reg in regs:
             reg_clean = reg.upper().replace(" ", "")
-            vehicle_text = row_joined
-            vehicle_class = classify_vehicle_class(vehicle_text)
-            # Heuristic driver: text immediately before vehicle/model columns is often a name.
             driver_name = None
             for txt in row_texts:
                 if txt and txt.upper().replace(" ", "") == reg_clean:
                     break
                 if txt and not looks_like_number(txt) and not looks_like_date(txt) and len(txt.split()) <= 4:
                     driver_name = txt
-
             registry[reg_clean] = {
                 "vehicle_registration": reg_clean,
-                "raw_vehicle": vehicle_text[:250],
-                "vehicle_class": vehicle_class,
+                "raw_vehicle": row_joined[:250],
+                "vehicle_class": classify_vehicle_class(row_joined),
                 "driver_name": driver_name,
                 "source": "vehicle_registry_parser",
             }
-
     diag["fleet_registry"] = list(registry.values())[:100]
     diag["fleet_registry_count"] = len(registry)
     return registry
@@ -1239,14 +1369,12 @@ def parse_electricity_sections(df_raw: pd.DataFrame, sections: List[Tuple[int, i
             dt = parse_date(label)
             if dt is None:
                 continue
-
             found = _find_numeric_near(df_raw, r, title_col, [4, 3, 5, 2, 1])
             if not found:
                 continue
             amount, amount_col = found
             if amount <= 0:
                 continue
-
             records.append(build_normalized_activity(
                 category="electricity",
                 amount=amount,
@@ -1282,18 +1410,15 @@ def parse_gas_sections(df_raw: pd.DataFrame, sections: List[Tuple[int, int, str]
                 break
             if period_text and re.search(r"electricity\s+usage|fuel\s+litres|business\s+miles", period_text, flags=re.I):
                 break
-
             start, end = parse_period_bounds(period_value)
             if start is None and end is None:
                 continue
-
             found = _find_numeric_near(df_raw, r, title_col, [2, 3, 4, 1])
             if not found:
                 continue
             amount, amount_col = found
             if amount <= 0:
                 continue
-
             dt_for_period = end or start
             records.append(build_normalized_activity(
                 category="fuel",
@@ -1332,14 +1457,12 @@ def parse_fuel_litres_sections(df_raw: pd.DataFrame, sections: List[Tuple[int, i
             dt = parse_date(date_value)
             if dt is None:
                 continue
-
             found = _find_numeric_near(df_raw, r, title_col, [1, 2, 3])
             if not found:
                 continue
             litres, amount_col = found
             if litres <= 0:
                 continue
-
             activity = build_normalized_activity(
                 category="liquid fuel",
                 amount=litres,
@@ -1361,11 +1484,7 @@ def parse_fuel_litres_sections(df_raw: pd.DataFrame, sections: List[Tuple[int, i
                 records.append(activity)
                 parsed += 1
             else:
-                diag.setdefault("excluded_sections", []).append({
-                    "section": title_text,
-                    "row_index_original": r + 1,
-                    "reason": "Fleet fuel block detected but excluded because include_fleet_fuel=False.",
-                })
+                diag.setdefault("excluded_sections", []).append({"section": title_text, "row_index_original": r + 1, "reason": "Fleet fuel block detected but excluded because include_fleet_fuel=False."})
         diag.setdefault("sections_parsed", []).append({"section": title_text, "record_count": parsed, "calculation_path": "liquid_fuel_litres" if include else "liquid_fuel_excluded"})
     return records
 
@@ -1375,16 +1494,13 @@ def parse_business_miles(df_raw: pd.DataFrame, sections: List[Tuple[int, int, st
     include_mileage = bool(opts.get("include_business_mileage", False))
     include_when_fuel_present = bool(opts.get("include_business_mileage_when_fuel_present", False))
     workbook_has_fuel = any(x.get("calculation_path") == "liquid_fuel_litres" and x.get("record_count", 0) > 0 for x in diag.get("sections_parsed", []))
-
     for title_row, title_col, title_text in sections[:5]:
         parsed = 0
-        # Most client sheets put driver names across header row and miles one row below.
         value_rows = [title_row + 1, title_row + 2]
         for c in range(title_col + 1, min(df_raw.shape[1], title_col + 20)):
             driver_name = safe_text(df_raw.iat[title_row, c]) if title_row < df_raw.shape[0] else None
             if not driver_name or driver_name.lower() in {"total", "business miles"}:
                 continue
-
             miles = None
             row_used = None
             for vr in value_rows:
@@ -1394,13 +1510,11 @@ def parse_business_miles(df_raw: pd.DataFrame, sections: List[Tuple[int, int, st
                     break
             if miles is None or miles < 0:
                 continue
-
             vehicle_record = None
             for item in vehicle_registry.values():
                 if safe_text(item.get("driver_name")) and safe_text(item.get("driver_name")).lower() == driver_name.lower():
                     vehicle_record = item
                     break
-
             activity = build_normalized_activity(
                 category="business travel",
                 amount=miles,
@@ -1419,7 +1533,6 @@ def parse_business_miles(df_raw: pd.DataFrame, sections: List[Tuple[int, int, st
                 raw_column=f"col_{c + 1}",
                 notes="Parsed from workbook business miles block.",
             )
-
             override_table = opts.get("vehicle_factor_overrides", {}) or {}
             override = override_table.get(activity.get("vehicle_class")) or override_table.get(driver_name)
             if override:
@@ -1433,20 +1546,12 @@ def parse_business_miles(df_raw: pd.DataFrame, sections: List[Tuple[int, int, st
                     "data_source_override": override.get("data_source", "Runtime vehicle factor override"),
                     "scope_override": override.get("scope", "Scope 3"),
                 })
-
             should_exclude = (not include_mileage) or (workbook_has_fuel and not include_when_fuel_present)
             if should_exclude:
-                diag.setdefault("excluded_sections", []).append({
-                    "section": title_text,
-                    "driver_name": driver_name,
-                    "vehicle_class": activity.get("vehicle_class"),
-                    "vehicle_registration": activity.get("vehicle_registration"),
-                    "reason": "Business mileage excluded to avoid double counting with direct fleet fuel or because include_business_mileage=False.",
-                })
+                diag.setdefault("excluded_sections", []).append({"section": title_text, "driver_name": driver_name, "vehicle_class": activity.get("vehicle_class"), "vehicle_registration": activity.get("vehicle_registration"), "reason": "Business mileage excluded to avoid double counting with direct fleet fuel or because include_business_mileage=False."})
             else:
                 records.append(activity)
                 parsed += 1
-
         diag.setdefault("sections_parsed", []).append({"section": title_text, "record_count": parsed, "calculation_path": "business_mileage" if include_mileage else "business_mileage_excluded"})
     return records
 
@@ -1457,9 +1562,7 @@ def parse_ev_charging(df_raw: pd.DataFrame, sections: List[Tuple[int, int, str]]
     for title_row, title_col, title_text in sections[:5]:
         totals_preview = []
         parsed = 0
-        # Look for date rows and sum numeric columns to the right.
-        candidate_cols = range(title_col + 1, min(df_raw.shape[1], title_col + 20))
-        for c in candidate_cols:
+        for c in range(title_col + 1, min(df_raw.shape[1], title_col + 20)):
             header = None
             for hr in range(title_row, min(df_raw.shape[0], title_row + 4)):
                 if safe_text(df_raw.iat[hr, c]):
@@ -1467,7 +1570,6 @@ def parse_ev_charging(df_raw: pd.DataFrame, sections: List[Tuple[int, int, str]]
                     break
             if not header:
                 continue
-
             total = 0.0
             count = 0
             for r in range(title_row + 1, min(df_raw.shape[0], title_row + 40)):
@@ -1496,7 +1598,6 @@ def parse_ev_charging(df_raw: pd.DataFrame, sections: List[Tuple[int, int, str]]
                     notes="Parsed from EV charging sub-meter block.",
                 ))
                 parsed += 1
-
         if totals_preview:
             diag.setdefault("ev_charging_preview", []).extend(totals_preview[:20])
         if totals_preview and not include:
@@ -1518,32 +1619,31 @@ def parse_energy_workbook_records(records: List[Dict[str, Any]], parser_options:
         "source_file": opts.get("source_file"),
         "source_sheet": opts.get("source_sheet"),
     }
-
     if df_raw.empty:
         append_parser_warning(diag, "Workbook records were empty.")
         return {"activities": [], "parser_diagnostics": diag}
 
+    # Critical fix: normal Excel sheets read with header=None should become tabular activities.
+    header_row = detect_header_row_in_raw_dataframe(df_raw)
+    if header_row is not None:
+        parsed = parse_tabular_records_from_raw_dataframe(df_raw, header_row, opts)
+        if parsed.get("activities"):
+            return parsed
+        append_parser_warning(diag, "A tabular header was detected but did not yield activity rows; falling back to workbook block parser.")
+
     sections = detect_workbook_sections(df_raw)
-    diag["sections_detected"] = {
-        key: [{"row": r + 1, "col": c + 1, "label": text} for r, c, text in vals[:10]]
-        for key, vals in sections.items() if vals
-    }
-
+    diag["sections_detected"] = {key: [{"row": r + 1, "col": c + 1, "label": text} for r, c, text in vals[:10]] for key, vals in sections.items() if vals}
     vehicle_registry = parse_vehicle_registry(df_raw, diag)
-
     activities: List[Dict[str, Any]] = []
     activities.extend(parse_electricity_sections(df_raw, sections.get("electricity", []), diag, opts))
     activities.extend(parse_gas_sections(df_raw, sections.get("gas", []), diag, opts))
     activities.extend(parse_fuel_litres_sections(df_raw, sections.get("fuel_litres", []), diag, opts))
     activities.extend(parse_ev_charging(df_raw, sections.get("ev_charging", []), diag, opts))
     activities.extend(parse_business_miles(df_raw, sections.get("business_miles", []), diag, opts, vehicle_registry))
-
     if sections.get("adblue"):
         append_parser_warning(diag, "AdBlue section detected. Default treatment is disclosure-only unless a confirmed factor override is supplied.")
-
     if not activities:
         append_parser_warning(diag, "No calculable activities were extracted. Check sheet layout, labels, parser options, or use a mapped upload template.")
-
     diag["extracted_activity_count"] = len(activities)
     return {"activities": activities, "parser_diagnostics": diag}
 
@@ -1556,8 +1656,9 @@ def prepare_activities_for_engine(activity_list: List[Dict[str, Any]], parser_op
     df_probe = pd.DataFrame(activity_list)
     if looks_like_canonical_activity_df(df_probe):
         canonical_df = preprocess_uploaded_dataframe(df_probe)
+        activities = [enrich_tabular_activity(rec, idx + 1, opts) for idx, rec in enumerate(canonical_df.to_dict(orient="records"))]
         return {
-            "activities": canonical_df.to_dict(orient="records"),
+            "activities": activities,
             "parser_diagnostics": {
                 "parser_used": "canonical_records",
                 "warnings": [],
@@ -1567,7 +1668,6 @@ def prepare_activities_for_engine(activity_list: List[Dict[str, Any]], parser_op
                 "source_sheet": opts.get("source_sheet"),
             },
         }
-
     return parse_energy_workbook_records(activity_list, opts)
 
 
@@ -1592,30 +1692,15 @@ def calculate_with_runtime_override(activity: Dict[str, Any], mapping: Dict[str,
     unit = validate_text_input(activity.get("unit"), "unit")
     canonical_category = mapping["canonical_category"] or "business travel"
     normalized_amount, normalized_unit, conversion_note = normalize_amount_and_unit(amount, unit, canonical_category)
-
     factor_unit = normalize_unit(activity.get("factor_unit_override")) or normalized_unit
-    if normalized_unit == "vehicle_km" and factor_unit == "vehicle_km":
-        amount_for_factor = normalized_amount
-    else:
-        amount_for_factor = amount
-
+    amount_for_factor = normalized_amount if normalized_unit == factor_unit else amount
     factor = validate_factor_value(activity.get("emission_factor_override"), "emission_factor_override")
     emissions_kg = amount_for_factor * factor
     factor_year = validate_year(first_non_blank(activity.get("factor_year_override"), activity.get("factor_year"), activity.get("year")))
-
     factor_quality = safe_text(activity.get("factor_quality_override")) or "runtime_override"
     scope = infer_scope_override(activity) or ("Scope 3" if canonical_category == "business travel" else "Unspecified")
-    category_display = {
-        "business travel": "Business Travel",
-        "liquid fuel": "Liquid Fuel",
-        "fuel": "Fuel",
-        "electricity": "Electricity",
-        "water": "Water",
-        "waste": "Waste",
-    }.get(canonical_category, canonical_category.title())
-
+    category_display = {"business travel": "Business Travel", "liquid fuel": "Liquid Fuel", "fuel": "Fuel", "electricity": "Electricity", "water": "Water", "waste": "Waste"}.get(canonical_category, canonical_category.title())
     formula = f"{amount_for_factor} {factor_unit} × {factor} kgCO2e/{factor_unit} = {emissions_kg} kgCO2e"
-
     row = {
         "category": category_display,
         "canonical_category": canonical_category,
@@ -1657,27 +1742,11 @@ def calculate_with_runtime_override(activity: Dict[str, Any], mapping: Dict[str,
     return pd.DataFrame([row])
 
 
-def build_result_row(
-    activity: Dict[str, Any],
-    category: str,
-    item_name: str,
-    input_amount: float,
-    input_unit: str,
-    normalized_amount: float,
-    normalized_unit: str,
-    factor_row: pd.Series,
-    factor_year_requested: int,
-    emissions_kg: float,
-    mapping: Dict[str, Any],
-    conversion_note: Optional[str],
-    match_type: str,
-    match_note: str,
-) -> pd.DataFrame:
+def build_result_row(activity: Dict[str, Any], category: str, item_name: str, input_amount: float, input_unit: str, normalized_amount: float, normalized_unit: str, factor_row: pd.Series, factor_year_requested: int, emissions_kg: float, mapping: Dict[str, Any], conversion_note: Optional[str], match_type: str, match_note: str) -> pd.DataFrame:
     factor = float(factor_row["kgCO2e_per_unit"])
     factor_quality = str(factor_row.get("factor_quality", "unknown"))
     calculation_basis = classify_calculation_basis(mapping.get("mapping_source"), factor_quality, match_type)
     formula = f"{normalized_amount} {normalized_unit} × {factor} kgCO2e/{normalized_unit} = {emissions_kg} kgCO2e"
-
     row = {
         "category": factor_row.get("display_category", category.title()),
         "canonical_category": category,
@@ -1716,65 +1785,32 @@ def build_result_row(
     }
     for field in METADATA_FIELDS:
         row[field] = activity.get(field)
-
     return pd.DataFrame([row])
 
 
 def calculate_emissions(activity: Dict[str, Any], factor_table: pd.DataFrame) -> pd.DataFrame:
     mapping = infer_canonical_category(activity)
     canonical_category = mapping["canonical_category"]
-
     if not canonical_category:
         raise ValueError(f"Unsupported or unmapped category: '{mapping.get('raw_category')}'. {SUPPORTED_CATEGORY_HINT}")
-
     if activity.get("emission_factor_override") is not None:
         return calculate_with_runtime_override(activity, mapping)
-
     input_unit = validate_text_input(activity.get("unit"), "unit")
     input_amount = validate_amount(activity.get("amount"))
     factor_year = get_factor_year(activity)
     item_name = infer_item_name(activity, canonical_category)
-
     normalized_amount, normalized_unit, conversion_note = normalize_amount_and_unit(input_amount, input_unit, canonical_category)
-
-    # Treatment defaults
     if canonical_category == "fuel" and item_name == "Natural gas" and normalized_unit == "kWh":
         normalized_unit = "kWh (Gross CV)"
         conversion_note = (conversion_note + " " if conversion_note else "") + "Natural gas kWh defaulted to Gross CV."
     if canonical_category == "electricity":
         item_name = "Electricity: UK"
-    if canonical_category == "liquid fuel" and item_name in {"Fuel", "Liquid Fuel", "fleet fuel"}:
+    if canonical_category == "liquid fuel" and item_name.lower() in {"fuel", "liquid fuel", "fleet fuel"}:
         item_name = "Diesel"
-
-    factor_row, match_type, match_note = match_factor(
-        category=canonical_category,
-        item_name=item_name,
-        unit=normalized_unit,
-        factor_year=factor_year,
-        factor_table=factor_table,
-        allow_year_fallback=True,
-        allow_generic_fallback=True,
-    )
-
+    factor_row, match_type, match_note = match_factor(canonical_category, item_name, normalized_unit, factor_year, factor_table, allow_year_fallback=True, allow_generic_fallback=True)
     factor = float(factor_row["kgCO2e_per_unit"])
     emissions_kg = normalized_amount * factor
-
-    return build_result_row(
-        activity=activity,
-        category=canonical_category,
-        item_name=item_name,
-        input_amount=input_amount,
-        input_unit=input_unit,
-        normalized_amount=normalized_amount,
-        normalized_unit=normalized_unit,
-        factor_row=factor_row,
-        factor_year_requested=factor_year,
-        emissions_kg=emissions_kg,
-        mapping=mapping,
-        conversion_note=conversion_note,
-        match_type=match_type,
-        match_note=match_note,
-    )
+    return build_result_row(activity, canonical_category, item_name, input_amount, input_unit, normalized_amount, normalized_unit, factor_row, factor_year, emissions_kg, mapping, conversion_note, match_type, match_note)
 
 
 # ============================================================
@@ -1782,6 +1818,8 @@ def calculate_emissions(activity: Dict[str, Any], factor_table: pd.DataFrame) ->
 # ============================================================
 def infer_issue_type_from_message(message: Any) -> str:
     msg = str(message or "").lower()
+    if "no calculable activities" in msg:
+        return "Parser extracted no activities"
     if "unmapped category" in msg or "unsupported category" in msg:
         return "Unmapped category"
     if "amount is required" in msg:
@@ -1802,7 +1840,7 @@ def infer_issue_type_from_message(message: Any) -> str:
 
 
 def infer_severity(issue_type: str, count: int = 1) -> str:
-    if issue_type in {"Unmapped category", "Factor matching failure", "Missing required field", "Missing unit", "Missing amount", "Non-numeric amount"}:
+    if issue_type in {"Parser extracted no activities", "Unmapped category", "Factor matching failure", "Missing required field", "Missing unit", "Missing amount", "Non-numeric amount"}:
         return "high"
     if issue_type in {"Invalid year", "Negative amount", "Other validation issue"}:
         return "medium"
@@ -1815,6 +1853,7 @@ def infer_severity(issue_type: str, count: int = 1) -> str:
 
 def infer_issue_guidance(issue_type: str) -> str:
     return {
+        "Parser extracted no activities": "The uploaded sheet was not recognised as a supported tabular activity file or semi-structured workbook. Check headers, use category/amount/unit columns, or add transformer mapping rules.",
         "Unmapped category": "Standardise category labels or extend CATEGORY_ALIASES / transformer mapping rules.",
         "Missing amount": "Add a valid numeric amount for affected rows.",
         "Non-numeric amount": "Replace text/malformed amount values with clean numbers.",
@@ -1831,13 +1870,7 @@ def group_errors(errors: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     grouped: Dict[str, Dict[str, Any]] = {}
     for err in errors:
         issue_type = infer_issue_type_from_message(err.get("error"))
-        item = grouped.setdefault(issue_type, {
-            "title": issue_type,
-            "count": 0,
-            "severity": "low",
-            "guidance": infer_issue_guidance(issue_type),
-            "examples": [],
-        })
+        item = grouped.setdefault(issue_type, {"title": issue_type, "count": 0, "severity": "low", "guidance": infer_issue_guidance(issue_type), "examples": []})
         item["count"] += 1
         bits = []
         for key in ["source_file", "source_sheet", "source_section"]:
@@ -1852,10 +1885,8 @@ def group_errors(errors: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         example = " - ".join(bits)
         if example and len(item["examples"]) < 5:
             item["examples"].append(example)
-
     for issue_type, item in grouped.items():
         item["severity"] = infer_severity(issue_type, item["count"])
-
     severity_order = {"high": 0, "medium": 1, "low": 2}
     return sorted(grouped.values(), key=lambda x: (severity_order.get(x["severity"], 9), -x["count"], x["title"]))
 
@@ -1870,6 +1901,7 @@ def build_errors_preview(errors: List[Dict[str, Any]], max_items: int = 50) -> L
 
 def calculate_confidence_score(report_df: pd.DataFrame, data_quality: Dict[str, Any], parser_diagnostics: Dict[str, Any]) -> Dict[str, Any]:
     total_rows = int(data_quality.get("total_rows", 0) or 0)
+    successful_rows = int(data_quality.get("successful_rows", 0) or 0)
     coverage = float(data_quality.get("coverage_percent", 0.0) or 0.0)
     inferred = int(data_quality.get("inferred_category_rows", 0) or 0)
     estimated = int(data_quality.get("estimated_rows", 0) or 0)
@@ -1881,6 +1913,8 @@ def calculate_confidence_score(report_df: pd.DataFrame, data_quality: Dict[str, 
 
     if total_rows <= 0:
         return {"score": 0, "label": "Low", "coverage_percent": 0.0, "notes": ["No extracted activity rows were available for calculation."]}
+    if successful_rows <= 0 or coverage <= 0:
+        return {"score": 0, "label": "Low", "coverage_percent": coverage, "notes": ["No rows were successfully calculated. Do not rely on the totals until parsing, validation, or factor-matching issues are fixed."]}
 
     score = 100.0
     score -= max(0.0, 100.0 - coverage) * 0.65
@@ -1892,16 +1926,12 @@ def calculate_confidence_score(report_df: pd.DataFrame, data_quality: Dict[str, 
     score -= min(parser_warnings * 3.0, 15.0)
     score -= min(excluded * 1.0, 8.0)
     score = int(round(max(0.0, min(100.0, score)), 0))
-
     label = "High" if score >= 80 else "Moderate" if score >= 60 else "Low"
     notes: List[str] = []
     if coverage >= 95:
         notes.append("Most extracted rows were processed successfully.")
-    elif coverage > 0:
-        notes.append("Some extracted rows were excluded due to validation, parsing, or factor matching issues.")
     else:
-        notes.append("No rows were successfully calculated.")
-
+        notes.append("Some extracted rows were excluded due to validation, parsing, or factor matching issues.")
     if inferred:
         notes.append(f"{inferred} row(s) relied on inferred category mapping.")
     if estimated:
@@ -1916,7 +1946,6 @@ def calculate_confidence_score(report_df: pd.DataFrame, data_quality: Dict[str, 
         notes.append(f"{parser_warnings} parser warning(s) should be reviewed.")
     if excluded:
         notes.append(f"{excluded} section/item(s) were intentionally excluded, commonly to avoid double counting.")
-
     return {"score": score, "label": label, "coverage_percent": coverage, "notes": notes}
 
 
@@ -1930,51 +1959,44 @@ def calculate_emissions_batch_safe(activity_list: List[Dict[str, Any]], factor_t
     mapping_rows: List[Dict[str, Any]] = []
     unmapped_categories: List[Any] = []
 
+    if not activity_list and parser_diagnostics.get("warnings"):
+        for warning in parser_diagnostics.get("warnings", []):
+            errors.append({
+                "row_index": None,
+                "row_index_original": None,
+                "source_file": parser_diagnostics.get("source_file"),
+                "source_sheet": parser_diagnostics.get("source_sheet"),
+                "source_section": None,
+                "original_category": None,
+                "input": {},
+                "error": warning,
+            })
+
     for idx, activity in enumerate(activity_list):
         try:
             activity_data = dict(activity)
             mapping = infer_canonical_category(activity_data)
-            mapping_rows.append({
-                "row_index": idx,
-                "original_category": mapping.get("raw_category"),
-                "canonical_category": mapping.get("canonical_category"),
-                "mapping_source": mapping.get("mapping_source"),
-                "mapping_confidence": mapping.get("mapping_confidence"),
-            })
-
+            mapping_rows.append({"row_index": idx, "original_category": mapping.get("raw_category"), "canonical_category": mapping.get("canonical_category"), "mapping_source": mapping.get("mapping_source"), "mapping_confidence": mapping.get("mapping_confidence")})
             if not mapping.get("canonical_category"):
                 unmapped_categories.append(mapping.get("raw_category"))
                 raise ValueError(f"Unsupported or unmapped category: '{mapping.get('raw_category')}'. {SUPPORTED_CATEGORY_HINT}")
-
             result = calculate_emissions(activity_data, factor_table=factor_table).copy()
             result["row_index"] = idx
             results.append(result)
-
         except Exception as exc:
-            errors.append({
-                "row_index": idx,
-                "row_index_original": activity.get("row_index_original", idx + 1),
-                "source_file": activity.get("source_file"),
-                "source_sheet": activity.get("source_sheet"),
-                "source_section": activity.get("source_section"),
-                "original_category": activity.get("category"),
-                "input": activity,
-                "error": str(exc),
-            })
+            errors.append({"row_index": idx, "row_index_original": activity.get("row_index_original", idx + 1), "source_file": activity.get("source_file"), "source_sheet": activity.get("source_sheet"), "source_section": activity.get("source_section"), "original_category": activity.get("category"), "input": activity, "error": str(exc)})
 
     final_report = pd.concat(results, ignore_index=True) if results else pd.DataFrame()
     total_kg = float(final_report["emissions_kgCO2e"].sum()) if not final_report.empty else 0.0
     total_t = total_kg / 1000.0
-
     total_rows = len(activity_list)
     successful_rows = len(final_report)
-    errored_rows = len(errors)
+    errored_rows = len([e for e in errors if e.get("row_index") is not None])
     coverage = round((successful_rows / total_rows) * 100, 2) if total_rows else 0.0
 
     mapping_df = pd.DataFrame(mapping_rows)
     mapped_rows = int(mapping_df["canonical_category"].notna().sum()) if not mapping_df.empty else 0
     inferred_rows = int((mapping_df["mapping_source"] == "inferred").sum()) if not mapping_df.empty else 0
-
     unmapped_summary: List[Dict[str, Any]] = []
     if unmapped_categories:
         s = pd.Series(unmapped_categories, dtype="object").fillna("blank").value_counts().reset_index()
@@ -2007,19 +2029,8 @@ def calculate_emissions_batch_safe(activity_list: List[Dict[str, Any]], factor_t
         "invalid_rows_percent": round((errored_rows / total_rows) * 100, 2) if total_rows else 0.0,
         "extracted_activity_count": total_rows,
     }
-
     confidence = calculate_confidence_score(final_report, data_quality, parser_diagnostics)
-
-    return {
-        "report": final_report,
-        "total_kgCO2e": total_kg,
-        "total_tCO2e": total_t,
-        "errors": errors,
-        "data_quality": data_quality,
-        "unmapped_categories": unmapped_summary,
-        "confidence": confidence,
-        "parser_diagnostics": parser_diagnostics,
-    }
+    return {"report": final_report, "total_kgCO2e": total_kg, "total_tCO2e": total_t, "errors": errors, "data_quality": data_quality, "unmapped_categories": unmapped_summary, "confidence": confidence, "parser_diagnostics": parser_diagnostics}
 
 
 # ============================================================
@@ -2069,14 +2080,7 @@ def summarize_factor_quality(report_df: pd.DataFrame) -> List[Dict[str, Any]]:
 def build_factor_transparency(report_df: pd.DataFrame) -> List[Dict[str, Any]]:
     if report_df.empty:
         return []
-    cols = [
-        "category", "canonical_category", "scope", "item_name", "vehicle_class", "vehicle_registration",
-        "factor_id", "factor_name", "factor_description", "emission_factor_kgCO2e_per_unit",
-        "normalized_unit", "factor_year", "factor_year_requested", "factor_source",
-        "factor_source_file", "factor_source_sheet", "factor_source_row", "factor_quality",
-        "factor_match_type", "factor_match_note", "calculation_basis", "source_file",
-        "source_sheet", "source_section", "reporting_period",
-    ]
+    cols = ["category", "canonical_category", "scope", "item_name", "vehicle_class", "vehicle_registration", "factor_id", "factor_name", "factor_description", "emission_factor_kgCO2e_per_unit", "normalized_unit", "factor_year", "factor_year_requested", "factor_source", "factor_source_file", "factor_source_sheet", "factor_source_row", "factor_quality", "factor_match_type", "factor_match_note", "calculation_basis", "source_file", "source_sheet", "source_section", "reporting_period"]
     available = [c for c in cols if c in report_df.columns]
     out = report_df[available].drop_duplicates().reset_index(drop=True)
     sort_cols = [c for c in ["category", "item_name", "factor_year"] if c in out.columns]
@@ -2111,26 +2115,19 @@ def build_plain_language_takeaways(report_df: pd.DataFrame, batch_result: Dict[s
     confidence = batch_result.get("confidence", {})
     pdx = batch_result.get("parser_diagnostics", {})
     takeaways: List[str] = []
-
     if total_kg > 0:
         takeaways.append(f"Total reported emissions are {round(total_t, 2)} tCO2e ({round(total_kg, 2)} kgCO2e) across the processed dataset.")
     else:
         takeaways.append("No reportable emissions were calculated from the current input.")
-
     if not summary_scope.empty:
         top = summary_scope.iloc[0]
         takeaways.append(f"{top['scope']} is the largest contributor, representing {round(float(top['percent_of_total']), 2)}% of total emissions.")
-
     top_category = analytics.get("top_category_by_kgco2e")
     if top_category:
         takeaways.append(f"The highest-emitting category is {top_category.get('category')}, contributing {round(float(top_category.get('emissions_kgCO2e', 0.0)), 2)} kgCO2e.")
-
-    coverage = dq.get("coverage_percent", 0.0)
-    takeaways.append(f"Data processing coverage is {coverage}%, based on extracted activity rows successfully included in the calculation.")
-
-    if pdx.get("parser_used") == "workbook_block_parser":
-        takeaways.append(f"The workbook parser extracted {pdx.get('extracted_activity_count', dq.get('extracted_activity_count', 0))} calculable activity row(s) from a semi-structured source.")
-
+    takeaways.append(f"Data processing coverage is {dq.get('coverage_percent', 0.0)}%, based on extracted activity rows successfully included in the calculation.")
+    if pdx.get("parser_used"):
+        takeaways.append(f"Parser used: {pdx.get('parser_used')}; extracted {pdx.get('extracted_activity_count', dq.get('extracted_activity_count', 0))} activity row(s).")
     if confidence:
         takeaways.append(f"The current confidence score is {confidence.get('score', 0)}/100, rated {confidence.get('label', 'Low')}.")
     return takeaways[:6]
@@ -2142,36 +2139,26 @@ def build_actionable_insights(report_df: pd.DataFrame, batch_result: Dict[str, A
     pdx = batch_result.get("parser_diagnostics", {})
     unmapped = batch_result.get("unmapped_categories", [])
     insights: List[Dict[str, Any]] = []
-
     if dq.get("extracted_activity_count", dq.get("total_rows", 0)) == 0:
         insights.append({"title": "Parser review required", "body": "No calculable activity rows were extracted. Check workbook structure, section labels, and parser options before issuing a client report."})
-
     if not summary_scope.empty:
         top = summary_scope.iloc[0]
         insights.append({"title": "Largest emission driver", "body": f"{top['scope']} is currently the biggest contributor at {round(float(top['emissions_kgCO2e']), 2)} kgCO2e ({round(float(top['percent_of_total']), 2)}% of total emissions)."})
-
     top_category = analytics.get("top_category_by_kgco2e")
     if top_category:
         insights.append({"title": "Priority reduction opportunity", "body": f"The category with the greatest impact is {top_category.get('category')}. This is the first place to investigate for reductions and data-quality review."})
-
     if dq.get("coverage_percent", 0.0) < 90 and dq.get("total_rows", 0) > 0:
         insights.append({"title": "Coverage improvement needed", "body": f"Coverage is currently {dq.get('coverage_percent', 0.0)}%. Resolve parser warnings, validation errors, and factor-matching failures before relying on totals externally."})
-
     if dq.get("starter_factor_rows", 0) > 0:
         insights.append({"title": "Replace starter factors", "body": f"{dq.get('starter_factor_rows', 0)} row(s) used starter/placeholder factors. Replace these with official DEFRA/UK Government factor rows for audit-grade reporting."})
-
     if dq.get("factor_fallback_rows", 0) > 0:
         insights.append({"title": "Review fallback matches", "body": f"{dq.get('factor_fallback_rows', 0)} row(s) used fallback factor matching. These line items should be reviewed before client release."})
-
     if pdx.get("excluded_sections"):
         insights.append({"title": "Double-counting safeguards applied", "body": f"{len(pdx.get('excluded_sections', []))} item(s) were excluded, commonly to avoid double counting fleet fuel/mileage or main electricity/EV sub-meter data."})
-
     if unmapped:
         insights.append({"title": "Category mapping improvement needed", "body": f"Some categories remain unmapped. Example: '{unmapped[0].get('category')}' appears {unmapped[0].get('count', 0)} time(s)."})
-
     if confidence and confidence.get("score", 0) < 60:
         insights.append({"title": "Low-confidence result", "body": f"The current confidence score is {confidence.get('score', 0)}/100. Input cleanup, official factor loading, and parser review should be prioritised."})
-
     return insights[:8]
 
 
@@ -2189,7 +2176,8 @@ def build_methodology_summary(batch_result: Dict[str, Any]) -> Dict[str, Any]:
         assumptions.append("Some rows used starter placeholder factors and require official factor replacement before final reporting.")
     if pdx.get("parser_used") == "workbook_block_parser":
         assumptions.append("A workbook block parser was used to normalise semi-structured client data into activity rows.")
-
+    if pdx.get("parser_used") == "tabular_header_parser":
+        assumptions.append("A header-row parser was used to normalise Excel sheet rows into activity records.")
     return {
         "framework": "GHG Protocol aligned reporting structure using activity data multiplied by emissions factors.",
         "factor_basis": "Engine supports 2023, 2024, and 2025 factor-year selection. Built-in starter rows should be replaced or supplemented with official UK Government/DEFRA flat-file factor rows for audit use.",
@@ -2210,15 +2198,11 @@ def build_final_response(batch_result: Dict[str, Any]) -> Dict[str, Any]:
     summary_scope = summarize_report_by_scope(report_df)
     summary_scope_category = summarize_report_by_scope_and_category(report_df)
     analytics = build_analytics(report_df)
-
     return {
         "line_items": report_df.to_dict(orient="records"),
         "summary_by_scope_category": summary_scope_category.to_dict(orient="records"),
         "summary_by_scope": summary_scope.to_dict(orient="records"),
-        "totals": {
-            "total_kgCO2e": batch_result["total_kgCO2e"],
-            "total_tCO2e": batch_result["total_tCO2e"],
-        },
+        "totals": {"total_kgCO2e": batch_result["total_kgCO2e"], "total_tCO2e": batch_result["total_tCO2e"]},
         "analytics": analytics,
         "top_categories_by_kgco2e": summarize_top_categories(report_df, 5),
         "top_sites_by_kgco2e": summarize_top_sites(report_df, 5),
@@ -2273,26 +2257,17 @@ def make_json_safe(obj: Any) -> Any:
 def run_emissions_engine(request_json: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(request_json, dict):
         raise ValueError("request_json must be a dictionary.")
-
     activities = request_json.get("activities", [])
     if not isinstance(activities, list):
         raise ValueError("activities must be a list.")
-
     parser_options = request_json.get("parser_options", {}) or {}
     if not isinstance(parser_options, dict):
         raise ValueError("parser_options must be a dictionary.")
-
     factor_rows = request_json.get("factor_rows")
     factor_table = normalise_factor_table(factor_rows if isinstance(factor_rows, list) else None)
-
     prepared = prepare_activities_for_engine(activities, parser_options=parser_options)
     normalized_activities = prepared.get("activities", [])
     parser_diagnostics = prepared.get("parser_diagnostics", {})
-
-    batch_result = calculate_emissions_batch_safe(
-        normalized_activities,
-        factor_table=factor_table,
-        parser_diagnostics=parser_diagnostics,
-    )
+    batch_result = calculate_emissions_batch_safe(normalized_activities, factor_table=factor_table, parser_diagnostics=parser_diagnostics)
     final_response = build_final_response(batch_result)
     return make_json_safe(final_response)
