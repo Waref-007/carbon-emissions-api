@@ -18,12 +18,14 @@ from engine import run_emissions_engine
 
 app = FastAPI(title="Carbon Emissions API")
 
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "https://gscsustainability.co.uk",
         "https://www.gscsustainability.co.uk",
+        "http://localhost:3000",
+        "http://localhost:5173",
+        "http://127.0.0.1:5500",
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -59,14 +61,14 @@ def debug_routes():
     }
 
 
-def safe_string(value):
+def safe_string(value: Any) -> str:
     if value is None:
         return ""
     return str(value).strip()
 
 
-def to_bool_string_true(value: str) -> bool:
-    return str(value).strip().lower() == "true"
+def to_bool(value: Any) -> bool:
+    return str(value).strip().lower() in {"true", "1", "yes", "y", "on"}
 
 
 DEFAULT_PARSER_OPTIONS = {
@@ -84,18 +86,21 @@ def build_parser_options(form_values: Dict[str, Any] | None = None) -> Dict[str,
     if not form_values:
         return options
 
+    bool_keys = {
+        "include_fleet_fuel",
+        "include_business_mileage",
+        "include_business_mileage_when_fuel_present",
+        "include_ev_charging_submeter",
+    }
+
     for key, value in form_values.items():
         if value is None or value == "":
             continue
-        if key in {
-            "include_fleet_fuel",
-            "include_business_mileage",
-            "include_business_mileage_when_fuel_present",
-            "include_ev_charging_submeter",
-        }:
-            options[key] = to_bool_string_true(value)
+        if key in bool_keys:
+            options[key] = to_bool(value)
         else:
             options[key] = value
+
     return options
 
 
@@ -108,131 +113,14 @@ def normalize_uploaded_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def sanitize_sheet_name(name: str) -> str:
-    if not name:
-        return "Sheet"
-    cleaned = re.sub(r"[\\/*?:\[\]]", "", str(name)).strip()
-    return cleaned[:31] if cleaned else "Sheet"
-
-
-def auto_fit_columns(ws, min_width=12, max_width=45):
-    for col_cells in ws.columns:
-        length = 0
-        col_letter = get_column_letter(col_cells[0].column)
-        for cell in col_cells:
-            try:
-                value = "" if cell.value is None else str(cell.value)
-                length = max(length, len(value))
-            except Exception:
-                pass
-        ws.column_dimensions[col_letter].width = min(max(length + 2, min_width), max_width)
-
-
-def style_report_sheet(ws, title="GS Carbon Emissions Report", subtitle="Generated from uploaded datasets"):
-    ws["A1"] = title
-    ws["A2"] = subtitle
-    ws["A3"] = "Aligned with GHG Protocol and DEFRA"
-
-    ws["A1"].font = Font(size=16, bold=True)
-    ws["A2"].font = Font(size=11, italic=True)
-    ws["A3"].font = Font(size=10)
-
-    header_fill = PatternFill(fill_type="solid", start_color="D9EAD3", end_color="D9EAD3")
-
-    if ws.max_row >= 7:
-        for cell in ws[7]:
-            cell.font = Font(bold=True)
-            cell.fill = header_fill
-
-    logo_path = "logo.png"
-    if os.path.exists(logo_path):
-        try:
-            logo = XLImage(logo_path)
-            logo.width = 140
-            logo.height = 70
-            ws.add_image(logo, "L1")
-        except Exception:
-            pass
-
-
-def add_bar_chart(ws, title, data_col, category_col, start_row, end_row, anchor):
-    if end_row <= start_row:
-        return
-
-    chart = BarChart()
-    chart.title = title
-    chart.y_axis.title = "kg CO2e"
-    chart.x_axis.title = "Category"
-
-    data = Reference(ws, min_col=data_col, min_row=start_row, max_row=end_row)
-    categories = Reference(ws, min_col=category_col, min_row=start_row + 1, max_row=end_row)
-
-    chart.add_data(data, titles_from_data=True)
-    chart.set_categories(categories)
-    chart.height = 8
-    chart.width = 16
-    ws.add_chart(chart, anchor)
-
-
-def add_pie_chart(ws, title, data_col, category_col, start_row, end_row, anchor):
-    if end_row <= start_row:
-        return
-
-    chart = PieChart()
-    chart.title = title
-
-    data = Reference(ws, min_col=data_col, min_row=start_row, max_row=end_row)
-    labels = Reference(ws, min_col=category_col, min_row=start_row + 1, max_row=end_row)
-
-    chart.add_data(data, titles_from_data=True)
-    chart.set_categories(labels)
-    chart.height = 8
-    chart.width = 12
-    ws.add_chart(chart, anchor)
-
-
-def validate_user_inputs(
-    privacy_consent: str,
-    contact_consent: str,
-    full_name: str,
-    email: str,
-    company_name: str,
-    phone_number: str,
-):
-    if not to_bool_string_true(privacy_consent):
-        raise HTTPException(status_code=400, detail="Privacy consent is required.")
-
-    if not to_bool_string_true(contact_consent):
-        raise HTTPException(status_code=400, detail="Contact consent is required.")
-
-    if not safe_string(full_name):
-        raise HTTPException(status_code=400, detail="Full name is required.")
-
-    if not safe_string(email):
-        raise HTTPException(status_code=400, detail="Email is required.")
-
-    if not safe_string(company_name):
-        raise HTTPException(status_code=400, detail="Company name is required.")
-
-    if not safe_string(phone_number):
-        raise HTTPException(status_code=400, detail="Phone number is required.")
-
-
-def build_user_object(full_name, email, company_name, phone_number):
-    return {
-        "full_name": full_name,
-        "email": email,
-        "company_name": company_name,
-        "phone_number": phone_number,
-    }
-
-
 def dataframe_to_workbook_records(df: pd.DataFrame) -> List[Dict[str, Any]]:
     df = df.copy()
     df = df.where(pd.notnull(df), None)
     records: List[Dict[str, Any]] = []
+
     for row in df.itertuples(index=False, name=None):
         records.append({f"col_{idx + 1}": value for idx, value in enumerate(row)})
+
     return records
 
 
@@ -248,65 +136,82 @@ def extract_file_sources(uploaded_file: UploadFile) -> Tuple[List[Dict[str, Any]
         if filename_lower.endswith(".csv"):
             df = pd.read_csv(
                 BytesIO(content),
-                dtype=str,
+                dtype=object,
                 keep_default_na=False,
                 engine="python",
                 on_bad_lines="skip",
             )
             df = normalize_uploaded_columns(df)
-            uploaded_sources.append({
-                "source_file": filename,
-                "source_type": "csv",
-                "sheet_name": None,
-                "records": df.where(pd.notnull(df), None).to_dict(orient="records"),
-                "rows": int(len(df)),
-                "columns": [str(c) for c in df.columns],
-            })
+
+            uploaded_sources.append(
+                {
+                    "source_file": filename,
+                    "source_type": "csv",
+                    "sheet_name": None,
+                    "records": df.where(pd.notnull(df), None).to_dict(orient="records"),
+                    "rows": int(len(df)),
+                    "columns": [str(c) for c in df.columns],
+                }
+            )
             return uploaded_sources, file_level_errors
 
         if filename_lower.endswith(".xlsx") or filename_lower.endswith(".xls"):
             excel_file = pd.ExcelFile(BytesIO(content))
+
             if not excel_file.sheet_names:
-                file_level_errors.append({
-                    "source_file": filename,
-                    "error": "Workbook contained no readable sheets.",
-                })
+                file_level_errors.append(
+                    {
+                        "source_file": filename,
+                        "error": "Workbook contained no readable sheets.",
+                    }
+                )
                 return uploaded_sources, file_level_errors
 
             for sheet_name in excel_file.sheet_names:
                 try:
-                    df_sheet = pd.read_excel(excel_file, sheet_name=sheet_name, header=None, dtype=object)
-                    raw_rows = int(df_sheet.shape[0])
-                    raw_cols = int(df_sheet.shape[1])
-                    uploaded_sources.append({
-                        "source_file": filename,
-                        "source_type": "excel_sheet",
-                        "sheet_name": sheet_name,
-                        "records": dataframe_to_workbook_records(df_sheet),
-                        "rows": raw_rows,
-                        "columns": [f"col_{i + 1}" for i in range(raw_cols)],
-                    })
+                    df_sheet = pd.read_excel(
+                        excel_file,
+                        sheet_name=sheet_name,
+                        header=None,
+                        dtype=object,
+                    )
+
+                    uploaded_sources.append(
+                        {
+                            "source_file": filename,
+                            "source_type": "excel_sheet",
+                            "sheet_name": sheet_name,
+                            "records": dataframe_to_workbook_records(df_sheet),
+                            "rows": int(df_sheet.shape[0]),
+                            "columns": [f"col_{i + 1}" for i in range(int(df_sheet.shape[1]))],
+                        }
+                    )
+
                 except Exception as sheet_error:
-                    file_level_errors.append({
-                        "source_file": filename,
-                        "source_sheet": sheet_name,
-                        "error": f"Could not read sheet '{sheet_name}': {type(sheet_error).__name__}: {str(sheet_error)}",
-                    })
+                    file_level_errors.append(
+                        {
+                            "source_file": filename,
+                            "source_sheet": sheet_name,
+                            "error": f"Could not read sheet '{sheet_name}': {type(sheet_error).__name__}: {str(sheet_error)}",
+                        }
+                    )
 
             return uploaded_sources, file_level_errors
 
         raise HTTPException(
             status_code=400,
-            detail=f"Unsupported file format for '{filename}'. Please upload CSV or Excel files.",
+            detail=f"Unsupported file format for '{filename}'. Please upload CSV, XLSX, or XLS files.",
         )
 
     except HTTPException:
         raise
     except Exception as e:
-        file_level_errors.append({
-            "source_file": filename,
-            "error": f"Unexpected file read error: {type(e).__name__}: {str(e)}",
-        })
+        file_level_errors.append(
+            {
+                "source_file": filename,
+                "error": f"Unexpected file read error: {type(e).__name__}: {str(e)}",
+            }
+        )
         return uploaded_sources, file_level_errors
 
 
@@ -330,6 +235,42 @@ def prepare_uploaded_sources(files: List[UploadFile]) -> Tuple[List[Dict[str, An
     return all_sources, file_level_errors, input_row_count
 
 
+def validate_user_inputs(
+    privacy_consent: str,
+    contact_consent: str,
+    full_name: str,
+    email: str,
+    company_name: str,
+    phone_number: str,
+):
+    if not to_bool(privacy_consent):
+        raise HTTPException(status_code=400, detail="Privacy consent is required.")
+
+    if not to_bool(contact_consent):
+        raise HTTPException(status_code=400, detail="Contact consent is required.")
+
+    if not safe_string(full_name):
+        raise HTTPException(status_code=400, detail="Full name is required.")
+
+    if not safe_string(email):
+        raise HTTPException(status_code=400, detail="Email is required.")
+
+    if not safe_string(company_name):
+        raise HTTPException(status_code=400, detail="Company name is required.")
+
+    if not safe_string(phone_number):
+        raise HTTPException(status_code=400, detail="Phone number is required.")
+
+
+def build_user_object(full_name, email, company_name, phone_number):
+    return {
+        "full_name": safe_string(full_name),
+        "email": safe_string(email),
+        "company_name": safe_string(company_name),
+        "phone_number": safe_string(phone_number),
+    }
+
+
 def _sum_numeric(values: List[Any]) -> float:
     total = 0.0
     for value in values:
@@ -337,28 +278,35 @@ def _sum_numeric(values: List[Any]) -> float:
             total += float(value or 0)
         except Exception:
             pass
-    return round(total, 4)
+    return round(total, 6)
 
 
 def _merge_count_dicts(dicts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     counts: Dict[str, int] = {}
+    key_name = "label"
+
     for item in dicts:
+        if not isinstance(item, dict):
+            continue
+
         key = safe_string(
             item.get("category")
             or item.get("error")
             or item.get("factor_quality")
             or item.get("title")
             or item.get("metric")
+            or item.get("label")
         )
+
         if not key:
             continue
+
         counts[key] = counts.get(key, 0) + int(item.get("count", 0) or 0)
 
-    key_name = "label"
-    for candidate in ["category", "error", "factor_quality", "title", "metric"]:
-        if dicts and candidate in dicts[0]:
-            key_name = candidate
-            break
+        for candidate in ["category", "error", "factor_quality", "title", "metric", "label"]:
+            if candidate in item:
+                key_name = candidate
+                break
 
     return [{key_name: key, "count": value} for key, value in counts.items()]
 
@@ -367,22 +315,28 @@ def _combine_issue_groups(issue_groups: List[Dict[str, Any]]) -> List[Dict[str, 
     grouped: Dict[str, Dict[str, Any]] = {}
 
     for item in issue_groups:
+        if not isinstance(item, dict):
+            continue
+
         title = safe_string(item.get("title"))
         if not title:
             continue
 
         existing = grouped.get(title)
+        examples = list(item.get("examples", []) or [])[:5]
+
         if not existing:
             grouped[title] = {
                 "title": title,
                 "count": int(item.get("count", 0) or 0),
                 "severity": item.get("severity", "low"),
                 "guidance": item.get("guidance", ""),
-                "examples": list(item.get("examples", []) or [])[:5],
+                "examples": examples,
             }
         else:
             existing["count"] += int(item.get("count", 0) or 0)
-            existing["examples"] = (existing["examples"] + list(item.get("examples", []) or []))[:5]
+            existing["examples"] = (existing["examples"] + examples)[:5]
+
             severity_rank = {"high": 3, "medium": 2, "low": 1}
             if severity_rank.get(item.get("severity", "low"), 0) > severity_rank.get(existing.get("severity", "low"), 0):
                 existing["severity"] = item.get("severity", "low")
@@ -390,36 +344,74 @@ def _combine_issue_groups(issue_groups: List[Dict[str, Any]]) -> List[Dict[str, 
     severity_order = {"high": 0, "medium": 1, "low": 2}
     return sorted(
         grouped.values(),
-        key=lambda x: (severity_order.get(x.get("severity", "low"), 9), -x.get("count", 0), x.get("title", "")),
+        key=lambda x: (
+            severity_order.get(x.get("severity", "low"), 9),
+            -int(x.get("count", 0) or 0),
+            x.get("title", ""),
+        ),
     )
+
+
+def _parser_warning_errors(parser_diagnostics: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    warnings: List[Dict[str, Any]] = []
+
+    for pdx in parser_diagnostics:
+        for warning in pdx.get("warnings", []) or []:
+            warnings.append(
+                {
+                    "source_file": pdx.get("source_file"),
+                    "source_sheet": pdx.get("source_sheet"),
+                    "source_section": None,
+                    "row_index_original": None,
+                    "error": warning,
+                }
+            )
+
+    return warnings
 
 
 def combine_engine_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
     line_items: List[Dict[str, Any]] = []
     errors: List[Dict[str, Any]] = []
     factor_transparency: List[Dict[str, Any]] = []
-    parser_warnings: List[Dict[str, Any]] = []
     parser_diagnostics: List[Dict[str, Any]] = []
     issue_groups: List[Dict[str, Any]] = []
     unmapped_categories: List[Dict[str, Any]] = []
     factor_quality_summary: List[Dict[str, Any]] = []
 
     totals_kg_values: List[Any] = []
-    input_rows = successful_rows = errored_rows = 0
-    mapped_rows = inferred_rows = exact_rows = estimated_rows = official_rows = starter_rows = 0
-    extracted_activities = 0
+
+    extracted_rows = 0
+    successful_rows = 0
+    errored_rows = 0
+    mapped_rows = 0
+    inferred_rows = 0
+    exact_rows = 0
+    estimated_rows = 0
+    official_rows = 0
+    starter_rows = 0
+    fallback_rows = 0
+    disclosure_rows = 0
+
+    engine_versions = []
 
     for result in results:
-        line_items.extend(result.get("line_items", []))
-        errors.extend(result.get("errors", []))
-        factor_transparency.extend(result.get("factor_transparency", []))
-        issue_groups.extend(result.get("issue_groups", []))
-        unmapped_categories.extend(result.get("unmapped_categories", []))
-        factor_quality_summary.extend(result.get("factor_quality_summary", []))
+        line_items.extend(result.get("line_items", []) or [])
+        errors.extend(result.get("errors", []) or [])
+        factor_transparency.extend(result.get("factor_transparency", []) or [])
+        issue_groups.extend(result.get("issue_groups", []) or [])
+        unmapped_categories.extend(result.get("unmapped_categories", []) or [])
+        factor_quality_summary.extend(result.get("factor_quality_summary", []) or [])
         totals_kg_values.append((result.get("totals") or {}).get("total_kgCO2e", 0))
+        if result.get("engine_version"):
+            engine_versions.append(result.get("engine_version"))
+
+        pdx = result.get("parser_diagnostics", {}) or {}
+        if pdx:
+            parser_diagnostics.append(pdx)
 
         dq = result.get("data_quality", {}) or {}
-        input_rows += int(dq.get("total_rows", 0) or 0)
+        extracted_rows += int(dq.get("total_rows", 0) or 0)
         successful_rows += int(dq.get("successful_rows", 0) or 0)
         errored_rows += int(dq.get("errored_rows", 0) or 0)
         mapped_rows += int(dq.get("mapped_category_rows", 0) or 0)
@@ -428,17 +420,11 @@ def combine_engine_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
         estimated_rows += int(dq.get("estimated_rows", 0) or 0)
         official_rows += int(dq.get("official_factor_rows", 0) or 0)
         starter_rows += int(dq.get("starter_factor_rows", 0) or 0)
+        fallback_rows += int(dq.get("factor_fallback_rows", 0) or 0)
+        disclosure_rows += int(dq.get("disclosure_only_rows", 0) or 0)
 
-        pdx = result.get("parser_diagnostics", {}) or {}
-        extracted_activities += int(pdx.get("extracted_activity_count", 0) or 0)
-        if pdx:
-            parser_diagnostics.append(pdx)
-            for warning in pdx.get("warnings", []) or []:
-                parser_warnings.append({
-                    "source_file": pdx.get("source_file", ""),
-                    "source_sheet": pdx.get("source_sheet", ""),
-                    "error": warning,
-                })
+    parser_warning_errors = _parser_warning_errors(parser_diagnostics)
+    combined_errors = parser_warning_errors + errors
 
     df_line = pd.DataFrame(line_items)
 
@@ -475,7 +461,7 @@ def combine_engine_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
                 df_line.groupby("category", as_index=False)[["emissions_kgCO2e", "emissions_tCO2e"]]
                 .sum()
                 .sort_values("emissions_kgCO2e", ascending=False)
-                .head(5)
+                .head(10)
                 .reset_index(drop=True)
             )
         else:
@@ -488,7 +474,7 @@ def combine_engine_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
                 working.groupby("site_name", as_index=False)[["emissions_kgCO2e", "emissions_tCO2e"]]
                 .sum()
                 .sort_values("emissions_kgCO2e", ascending=False)
-                .head(5)
+                .head(10)
                 .reset_index(drop=True)
             )
         else:
@@ -500,38 +486,42 @@ def combine_engine_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
         df_sites = pd.DataFrame(columns=["site_name", "emissions_kgCO2e", "emissions_tCO2e"])
 
     total_kg = _sum_numeric(totals_kg_values)
-    total_t = round(total_kg / 1000, 4)
-    coverage_percent = round((successful_rows / input_rows) * 100, 2) if input_rows > 0 else 0.0
+    total_t = round(total_kg / 1000, 6)
+    coverage_percent = round((successful_rows / extracted_rows) * 100, 2) if extracted_rows > 0 else 0.0
 
-    confidence_score = 0
-    if input_rows > 0:
+    if extracted_rows <= 0 or successful_rows <= 0 or coverage_percent <= 0:
+        confidence_score = 0
+        confidence_label = "Low"
+        confidence_notes = [
+            "No rows were successfully calculated. Do not rely on totals until parsing, validation, or factor-matching issues are fixed."
+        ]
+    else:
         confidence_score = round(
             max(
                 0.0,
                 min(
                     100.0,
                     100.0
-                    - max(0.0, 100.0 - coverage_percent) * 0.6
-                    - (estimated_rows / max(input_rows, 1)) * 15.0
-                    - (starter_rows / max(input_rows, 1)) * 15.0,
+                    - max(0.0, 100.0 - coverage_percent) * 0.65
+                    - (estimated_rows / max(extracted_rows, 1)) * 18.0
+                    - (starter_rows / max(extracted_rows, 1)) * 25.0
+                    - (fallback_rows / max(extracted_rows, 1)) * 10.0,
                 ),
             ),
             0,
         )
+        confidence_label = "High" if confidence_score >= 80 else "Moderate" if confidence_score >= 60 else "Low"
+        confidence_notes = [f"{coverage_percent}% of extracted activity rows were processed successfully."]
 
-    confidence_label = "High" if confidence_score >= 80 else "Moderate" if confidence_score >= 60 else "Low"
+        if starter_rows > 0:
+            confidence_notes.append(f"{starter_rows} row(s) used starter placeholder factor rows.")
+        if fallback_rows > 0:
+            confidence_notes.append(f"{fallback_rows} row(s) used fallback factor matching.")
+        if estimated_rows > 0:
+            confidence_notes.append(f"{estimated_rows} row(s) used estimated or non-exact treatment.")
 
-    notes: List[str] = []
-    if extracted_activities == 0:
-        notes.append("No calculable activities were extracted from the uploaded files.")
-    if coverage_percent > 0:
-        notes.append(f"{coverage_percent}% of extracted activity rows were processed successfully.")
-    if starter_rows > 0:
-        notes.append(f"{starter_rows} row(s) used starter placeholder factor tables.")
-    if not notes:
-        notes.append("Review parser diagnostics and errors before relying on this result externally.")
+    analytics: Dict[str, Any] = {"average_emissions_per_row_kgco2e": 0.0}
 
-    analytics = {"average_emissions_per_row_kgco2e": 0.0}
     if not df_line.empty and "emissions_kgCO2e" in df_line.columns:
         analytics["average_emissions_per_row_kgco2e"] = round(float(df_line["emissions_kgCO2e"].mean()), 4)
         if not df_cat.empty:
@@ -543,48 +533,84 @@ def combine_engine_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
         if not df_scope.empty:
             analytics["top_scope_by_kgco2e"] = df_scope.iloc[0].to_dict()
 
-    plain_language_takeaways = []
+    plain_language_takeaways: List[str] = []
+
     if total_kg > 0:
-        plain_language_takeaways.append(f"Total reported emissions are {round(total_t, 2)} tCO2e ({round(total_kg, 2)} kgCO2e).")
-    if not df_scope.empty:
-        row0 = df_scope.iloc[0]
-        plain_language_takeaways.append(f"{row0['scope']} is the largest contributor at {round(float(row0['percent_of_total']), 2)}% of total emissions.")
-    if extracted_activities > 0:
-        plain_language_takeaways.append(f"The parser extracted {extracted_activities} calculable activity row(s) from the uploaded files.")
-    if coverage_percent < 100:
-        plain_language_takeaways.append(f"Coverage is {coverage_percent}%, so some extracted rows were excluded due to validation or factor-matching issues.")
-    if not plain_language_takeaways:
-        plain_language_takeaways.append("No reportable emissions were produced from the uploaded data.")
+        plain_language_takeaways.append(
+            f"Total reported emissions are {round(total_t, 2)} tCO2e ({round(total_kg, 2)} kgCO2e)."
+        )
+    else:
+        plain_language_takeaways.append("No reportable emissions were calculated from the current upload.")
 
-    actionable_insights = []
-    if extracted_activities == 0:
-        actionable_insights.append({
-            "title": "Parser review required",
-            "body": "No calculable activity rows were extracted. Check workbook structure, source labels, and parser diagnostics before issuing a client report.",
-        })
-    if coverage_percent < 90 and input_rows > 0:
-        actionable_insights.append({
-            "title": "Coverage improvement needed",
-            "body": f"Coverage is currently {coverage_percent}%. Resolve parser warnings and validation errors before relying on totals externally.",
-        })
+    if not df_scope.empty and total_kg > 0:
+        top_scope = df_scope.iloc[0]
+        plain_language_takeaways.append(
+            f"{top_scope['scope']} is the largest contributor, representing {round(float(top_scope['percent_of_total']), 2)}% of total emissions."
+        )
+
+    if not df_cat.empty and total_kg > 0:
+        top_cat = df_cat.iloc[0]
+        plain_language_takeaways.append(
+            f"The highest-emitting category is {top_cat.get('category')}, contributing {round(float(top_cat.get('emissions_kgCO2e', 0)), 2)} kgCO2e."
+        )
+
+    plain_language_takeaways.append(
+        f"The parser extracted {extracted_rows} activity row(s), and {successful_rows} row(s) were calculated successfully."
+    )
+
+    plain_language_takeaways.append(
+        f"The current confidence score is {int(confidence_score)}/100, rated {confidence_label}."
+    )
+
+    actionable_insights: List[Dict[str, Any]] = []
+
+    if extracted_rows == 0 or successful_rows == 0:
+        actionable_insights.append(
+            {
+                "title": "Parser review required",
+                "body": "No calculable activity rows were successfully calculated. Check workbook structure, headers, category/amount/unit fields, parser diagnostics, and factor matching before issuing a client report.",
+            }
+        )
+
+    if coverage_percent < 90 and extracted_rows > 0:
+        actionable_insights.append(
+            {
+                "title": "Coverage improvement needed",
+                "body": f"Coverage is currently {coverage_percent}%. Resolve validation, parsing, and factor-matching issues before relying on totals externally.",
+            }
+        )
+
     if starter_rows > 0:
-        actionable_insights.append({
-            "title": "Replace starter factors",
-            "body": f"{starter_rows} row(s) used starter placeholder factors. Replace these with your official DEFRA-aligned factor library for external reporting.",
-        })
+        actionable_insights.append(
+            {
+                "title": "Replace starter factors",
+                "body": f"{starter_rows} row(s) used starter or placeholder factors. Replace these with official DEFRA / UK Government factor rows for audit-grade reporting.",
+            }
+        )
 
-    combined_errors = parser_warnings + errors
+    if fallback_rows > 0:
+        actionable_insights.append(
+            {
+                "title": "Review fallback factor matches",
+                "body": f"{fallback_rows} row(s) used fallback factor matching. Review the factor transparency table before client release.",
+            }
+        )
+
+    if not df_scope.empty and total_kg > 0:
+        top_scope = df_scope.iloc[0]
+        actionable_insights.append(
+            {
+                "title": "Largest emissions driver",
+                "body": f"{top_scope['scope']} is the largest contributor at {round(float(top_scope['emissions_kgCO2e']), 2)} kgCO2e.",
+            }
+        )
+
     if combined_errors:
-        df_errors_tmp = pd.DataFrame(combined_errors)
-        if "error" in df_errors_tmp.columns:
-            error_summary = (
-                df_errors_tmp["error"]
-                .astype(str)
-                .value_counts()
-                .reset_index()
-            )
-            error_summary.columns = ["error", "count"]
-            error_summary = error_summary.to_dict(orient="records")
+        df_errors = pd.DataFrame(combined_errors)
+        if "error" in df_errors.columns:
+            error_summary_df = df_errors["error"].astype(str).value_counts().reset_index()
+            error_summary_df.columns = ["error", "count"]
+            error_summary = error_summary_df.to_dict(orient="records")
         else:
             error_summary = []
     else:
@@ -604,10 +630,10 @@ def combine_engine_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
             "score": int(confidence_score),
             "label": confidence_label,
             "coverage_percent": coverage_percent,
-            "notes": notes,
+            "notes": confidence_notes,
         },
         "data_quality": {
-            "total_rows": input_rows,
+            "total_rows": extracted_rows,
             "successful_rows": successful_rows,
             "errored_rows": errored_rows,
             "coverage_percent": coverage_percent,
@@ -617,9 +643,11 @@ def combine_engine_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
             "estimated_rows": estimated_rows,
             "official_factor_rows": official_rows,
             "starter_factor_rows": starter_rows,
+            "factor_fallback_rows": fallback_rows,
+            "disclosure_only_rows": disclosure_rows,
             "valid_rows_percent": coverage_percent,
-            "invalid_rows_percent": round((errored_rows / input_rows) * 100, 2) if input_rows > 0 else 0.0,
-            "extracted_activity_count": extracted_activities,
+            "invalid_rows_percent": round((errored_rows / extracted_rows) * 100, 2) if extracted_rows > 0 else 0.0,
+            "extracted_activity_count": extracted_rows,
         },
         "parser_diagnostics": parser_diagnostics,
         "errors": combined_errors,
@@ -630,18 +658,20 @@ def combine_engine_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
         "factor_transparency": factor_transparency,
         "factor_quality_summary": _merge_count_dicts(factor_quality_summary),
         "methodology_summary": {
-            "framework": "GHG Protocol aligned reporting structure using uploaded activity data and emissions factors.",
-            "factor_basis": "Workbook-style uploads are parsed into normalized activities before calculation. Fuel, electricity, gas, and water use built-in factors in the current engine. Some business-travel and waste paths remain starter tables until replaced with your official DEFRA source tables.",
-            "calculation_logic": "Each uploaded source is parsed, normalized into activity rows, matched to an emissions factor, multiplied by the activity quantity, and aggregated into total CO2e outputs.",
+            "framework": "GHG Protocol aligned reporting structure using uploaded activity data multiplied by emissions factors.",
+            "factor_basis": "The engine supports built-in factors and custom factor_rows. Starter or placeholder factors must be replaced with official DEFRA / UK Government conversion-factor rows before audit-grade reporting.",
+            "calculation_logic": "Each uploaded source is parsed into activity rows, normalised, matched to an emissions factor, multiplied by the activity quantity, and aggregated into CO2e outputs.",
             "assumptions": [
                 "Fleet fuel litres are included by default.",
-                "Business mileage is excluded by default when direct fleet fuel data is present to avoid double counting.",
-                "EV charging sub-meter rows are excluded by default to avoid double counting against main electricity unless explicitly enabled.",
+                "Business mileage is excluded by default where direct fuel data is present to reduce double counting risk.",
+                "EV charging sub-meter rows are excluded by default unless explicitly enabled, to reduce double counting against main electricity.",
+                "A confidence score of zero is returned when no rows are successfully calculated.",
             ],
             "interpretation_notes": [
-                "Review parser diagnostics and excluded sections alongside the final totals.",
-                "Do not issue a client report if extracted activity count is zero or coverage is materially incomplete.",
+                "Review parser diagnostics, issue groups, factor transparency, and data quality before issuing any client-facing report.",
+                "Do not issue a client report if extracted activity count is zero, coverage is materially incomplete, or placeholder/fallback factors remain unresolved.",
             ],
+            "engine_versions_seen": sorted(set(engine_versions)),
         },
     }
 
@@ -661,10 +691,13 @@ def run_engine_for_uploaded_sources(uploaded_sources: List[Dict[str, Any]], pars
         }
 
         result = run_emissions_engine(request_json)
+
         pdx = result.get("parser_diagnostics", {}) or {}
         pdx["source_file"] = source.get("source_file")
         pdx["source_sheet"] = source.get("sheet_name")
+        pdx["source_type"] = source.get("source_type")
         result["parser_diagnostics"] = pdx
+
         source_results.append(result)
 
     return combine_engine_results(source_results)
@@ -675,6 +708,7 @@ def merge_file_errors_with_result(base_result: dict, file_level_errors: list) ->
     combined_errors = file_level_errors + result.get("errors", [])
     result["errors"] = combined_errors
     result["errors_preview"] = combined_errors[:50]
+    result["error_count"] = len(combined_errors)
 
     if combined_errors:
         df_errors = pd.DataFrame(combined_errors)
@@ -698,6 +732,7 @@ def build_api_response(
     contact_consent: bool = True,
 ) -> dict:
     errors = full_result.get("errors", [])
+
     return {
         "totals": full_result.get("totals", {}),
         "summary_by_scope": full_result.get("summary_by_scope", []),
@@ -763,66 +798,166 @@ def send_lead_to_logger(user_data: dict, result: dict, uploaded_files_info: list
         print(f"Lead logger failed: {type(e).__name__}: {str(e)}")
 
 
+def sanitize_sheet_name(name: str) -> str:
+    if not name:
+        return "Sheet"
+    cleaned = re.sub(r"[\\/*?:\[\]]", "", str(name)).strip()
+    return cleaned[:31] if cleaned else "Sheet"
+
+
+def auto_fit_columns(ws, min_width=12, max_width=45):
+    for col_cells in ws.columns:
+        length = 0
+        col_letter = get_column_letter(col_cells[0].column)
+        for cell in col_cells:
+            try:
+                value = "" if cell.value is None else str(cell.value)
+                length = max(length, len(value))
+            except Exception:
+                pass
+        ws.column_dimensions[col_letter].width = min(max(length + 2, min_width), max_width)
+
+
+def style_report_sheet(ws, title="GS Carbon Emissions Report", subtitle="Generated from uploaded datasets"):
+    ws["A1"] = title
+    ws["A2"] = subtitle
+    ws["A3"] = "Aligned with GHG Protocol and DEFRA / UK Government conversion-factor methodology"
+
+    ws["A1"].font = Font(size=16, bold=True)
+    ws["A2"].font = Font(size=11, italic=True)
+    ws["A3"].font = Font(size=10)
+
+    header_fill = PatternFill(fill_type="solid", start_color="D9EAD3", end_color="D9EAD3")
+
+    if ws.max_row >= 7:
+        for cell in ws[7]:
+            cell.font = Font(bold=True)
+            cell.fill = header_fill
+
+    logo_path = "logo.png"
+    if os.path.exists(logo_path):
+        try:
+            logo = XLImage(logo_path)
+            logo.width = 140
+            logo.height = 70
+            ws.add_image(logo, "L1")
+        except Exception:
+            pass
+
+
 def write_df(writer, sheet_name: str, df: pd.DataFrame):
     sheet_name = sanitize_sheet_name(sheet_name)
     if df is None or df.empty:
-        pd.DataFrame([{"message": "No data available"}]).to_excel(writer, sheet_name=sheet_name, index=False, startrow=6)
+        pd.DataFrame([{"message": "No data available"}]).to_excel(
+            writer,
+            sheet_name=sheet_name,
+            index=False,
+            startrow=6,
+        )
     else:
         df.to_excel(writer, sheet_name=sheet_name, index=False, startrow=6)
 
 
-def build_overview_dataframe(result: dict, uploaded_files_info: list):
+def add_bar_chart(ws, title, data_col, category_col, start_row, end_row, anchor):
+    if end_row <= start_row:
+        return
+
+    chart = BarChart()
+    chart.title = title
+    chart.y_axis.title = "kg CO2e"
+    chart.x_axis.title = "Category"
+
+    data = Reference(ws, min_col=data_col, min_row=start_row, max_row=end_row)
+    categories = Reference(ws, min_col=category_col, min_row=start_row + 1, max_row=end_row)
+
+    chart.add_data(data, titles_from_data=True)
+    chart.set_categories(categories)
+    chart.height = 8
+    chart.width = 16
+    ws.add_chart(chart, anchor)
+
+
+def add_pie_chart(ws, title, data_col, category_col, start_row, end_row, anchor):
+    if end_row <= start_row:
+        return
+
+    chart = PieChart()
+    chart.title = title
+
+    data = Reference(ws, min_col=data_col, min_row=start_row, max_row=end_row)
+    labels = Reference(ws, min_col=category_col, min_row=start_row + 1, max_row=end_row)
+
+    chart.add_data(data, titles_from_data=True)
+    chart.set_categories(labels)
+    chart.height = 8
+    chart.width = 12
+    ws.add_chart(chart, anchor)
+
+
+def build_overview_dataframe(result: dict, uploaded_files_info: list) -> pd.DataFrame:
     totals = result.get("totals", {})
     confidence = result.get("confidence_score", {})
     dq = result.get("data_quality", {})
 
-    return pd.DataFrame([{
-        "total_kgCO2e": totals.get("total_kgCO2e", 0),
-        "total_tCO2e": totals.get("total_tCO2e", 0),
-        "input_row_count": result.get("input_row_count", 0),
-        "uploaded_files_count": len(uploaded_files_info),
-        "error_count": result.get("error_count", 0),
-        "confidence_score": confidence.get("score", 0),
-        "confidence_label": confidence.get("label", ""),
-        "coverage_percent": dq.get("coverage_percent", 0),
-        "valid_rows_percent": dq.get("valid_rows_percent", 0),
-        "invalid_rows_percent": dq.get("invalid_rows_percent", 0),
-        "extracted_activity_count": dq.get("extracted_activity_count", 0),
-        "privacy_consent": result.get("privacy_consent", False),
-        "contact_consent": result.get("contact_consent", False),
-    }])
+    return pd.DataFrame(
+        [
+            {
+                "total_kgCO2e": totals.get("total_kgCO2e", 0),
+                "total_tCO2e": totals.get("total_tCO2e", 0),
+                "input_row_count": result.get("input_row_count", 0),
+                "uploaded_files_count": len(uploaded_files_info),
+                "error_count": result.get("error_count", 0),
+                "confidence_score": confidence.get("score", 0),
+                "confidence_label": confidence.get("label", ""),
+                "coverage_percent": dq.get("coverage_percent", 0),
+                "valid_rows_percent": dq.get("valid_rows_percent", 0),
+                "invalid_rows_percent": dq.get("invalid_rows_percent", 0),
+                "extracted_activity_count": dq.get("extracted_activity_count", 0),
+                "privacy_consent": result.get("privacy_consent", False),
+                "contact_consent": result.get("contact_consent", False),
+            }
+        ]
+    )
 
 
-def build_executive_summary_dataframe(result: dict):
+def build_executive_summary_dataframe(result: dict) -> pd.DataFrame:
     totals = result.get("totals", {})
     analytics = result.get("analytics", {})
     confidence = result.get("confidence_score", {})
     dq = result.get("data_quality", {})
-    top_category = analytics.get("top_category_by_kgco2e", {})
-    top_site = analytics.get("top_site_by_kgco2e", {})
+    top_category = analytics.get("top_category_by_kgco2e", {}) or {}
+    top_site = analytics.get("top_site_by_kgco2e", {}) or {}
     top_scope = (result.get("summary_by_scope") or [{}])[0]
 
-    return pd.DataFrame([{
-        "total_tCO2e": totals.get("total_tCO2e", 0),
-        "total_kgCO2e": totals.get("total_kgCO2e", 0),
-        "largest_scope": top_scope.get("scope", ""),
-        "largest_scope_percent": top_scope.get("percent_of_total", 0),
-        "top_category": top_category.get("category", ""),
-        "top_category_kgCO2e": top_category.get("emissions_kgCO2e", 0),
-        "top_site": top_site.get("site_name", ""),
-        "top_site_kgCO2e": top_site.get("emissions_kgCO2e", 0),
-        "confidence_score": confidence.get("score", 0),
-        "confidence_label": confidence.get("label", ""),
-        "coverage_percent": dq.get("coverage_percent", 0),
-        "extracted_activity_count": dq.get("extracted_activity_count", 0),
-    }])
+    return pd.DataFrame(
+        [
+            {
+                "total_tCO2e": totals.get("total_tCO2e", 0),
+                "total_kgCO2e": totals.get("total_kgCO2e", 0),
+                "largest_scope": top_scope.get("scope", ""),
+                "largest_scope_percent": top_scope.get("percent_of_total", 0),
+                "top_category": top_category.get("category", ""),
+                "top_category_kgCO2e": top_category.get("emissions_kgCO2e", 0),
+                "top_site": top_site.get("site_name", ""),
+                "top_site_kgCO2e": top_site.get("emissions_kgCO2e", 0),
+                "confidence_score": confidence.get("score", 0),
+                "confidence_label": confidence.get("label", ""),
+                "coverage_percent": dq.get("coverage_percent", 0),
+                "extracted_activity_count": dq.get("extracted_activity_count", 0),
+            }
+        ]
+    )
 
 
 def write_summary_sheet(writer, result: dict):
     workbook = writer.book
     ws = workbook.create_sheet("Executive Summary")
 
-    style_report_sheet(ws, title="GS Carbon Emissions Report", subtitle="Executive summary for uploaded datasets")
+    style_report_sheet(
+        ws,
+        title="GS Carbon Emissions Report",
+        subtitle="Executive summary for uploaded datasets",
+    )
 
     totals = result.get("totals", {})
     confidence = result.get("confidence_score", {})
@@ -897,7 +1032,11 @@ def write_charts_sheet(writer, result: dict):
     workbook = writer.book
     ws = workbook.create_sheet("Charts")
 
-    style_report_sheet(ws, title="GS Carbon Emissions Report", subtitle="Visual summary of uploaded datasets")
+    style_report_sheet(
+        ws,
+        title="GS Carbon Emissions Report",
+        subtitle="Visual summary of uploaded datasets",
+    )
 
     scope_rows = result.get("summary_by_scope", [])
     cat_rows = result.get("summary_by_scope_category", [])
@@ -958,7 +1097,9 @@ def build_excel_report(result: dict, uploaded_files_info: list) -> io.BytesIO:
         "Error Summary": pd.DataFrame(result.get("error_summary", [])),
         "Uploaded Files": pd.DataFrame(uploaded_files_info),
         "Results": pd.DataFrame(result.get("line_items", [])),
-        "Analytics": pd.DataFrame([{"metric": k, "value": str(v)} for k, v in (result.get("analytics", {}) or {}).items()]),
+        "Analytics": pd.DataFrame(
+            [{"metric": k, "value": str(v)} for k, v in (result.get("analytics", {}) or {}).items()]
+        ),
         "Methodology": pd.DataFrame([result.get("methodology_summary", {})]) if result.get("methodology_summary") else pd.DataFrame(),
         "User Details": pd.DataFrame([result.get("user", {})]),
         "Unmapped Categories": pd.DataFrame(result.get("unmapped_categories", [])),
@@ -988,11 +1129,20 @@ def calculate(payload: dict):
     try:
         activities = payload.get("activities", [])
         parser_options = build_parser_options(payload.get("parser_options", {}))
+        factor_rows = payload.get("factor_rows")
 
         if not isinstance(activities, list):
             raise HTTPException(status_code=400, detail="activities must be a list")
 
-        return run_emissions_engine({"activities": activities, "parser_options": parser_options})
+        request_json = {
+            "activities": activities,
+            "parser_options": parser_options,
+        }
+
+        if isinstance(factor_rows, list):
+            request_json["factor_rows"] = factor_rows
+
+        return run_emissions_engine(request_json)
 
     except HTTPException:
         raise
@@ -1028,14 +1178,16 @@ async def upload_calculate(
 
         user = build_user_object(full_name, email, company_name, phone_number)
 
-        parser_options = build_parser_options({
-            "include_fleet_fuel": include_fleet_fuel,
-            "include_business_mileage": include_business_mileage,
-            "include_business_mileage_when_fuel_present": include_business_mileage_when_fuel_present,
-            "include_ev_charging_submeter": include_ev_charging_submeter,
-            "fleet_fuel_type": fleet_fuel_type,
-            "electricity_country": electricity_country,
-        })
+        parser_options = build_parser_options(
+            {
+                "include_fleet_fuel": include_fleet_fuel,
+                "include_business_mileage": include_business_mileage,
+                "include_business_mileage_when_fuel_present": include_business_mileage_when_fuel_present,
+                "include_ev_charging_submeter": include_ev_charging_submeter,
+                "fleet_fuel_type": fleet_fuel_type,
+                "electricity_country": electricity_country,
+            }
+        )
 
         uploaded_sources, file_level_errors, input_row_count = prepare_uploaded_sources(files)
 
@@ -1112,14 +1264,16 @@ async def upload_calculate_download(
 
         user = build_user_object(full_name, email, company_name, phone_number)
 
-        parser_options = build_parser_options({
-            "include_fleet_fuel": include_fleet_fuel,
-            "include_business_mileage": include_business_mileage,
-            "include_business_mileage_when_fuel_present": include_business_mileage_when_fuel_present,
-            "include_ev_charging_submeter": include_ev_charging_submeter,
-            "fleet_fuel_type": fleet_fuel_type,
-            "electricity_country": electricity_country,
-        })
+        parser_options = build_parser_options(
+            {
+                "include_fleet_fuel": include_fleet_fuel,
+                "include_business_mileage": include_business_mileage,
+                "include_business_mileage_when_fuel_present": include_business_mileage_when_fuel_present,
+                "include_ev_charging_submeter": include_ev_charging_submeter,
+                "fleet_fuel_type": fleet_fuel_type,
+                "electricity_country": electricity_country,
+            }
+        )
 
         uploaded_sources, file_level_errors, input_row_count = prepare_uploaded_sources(files)
 
